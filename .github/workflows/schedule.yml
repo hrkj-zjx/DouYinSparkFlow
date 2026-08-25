@@ -1,12 +1,13 @@
-name: DouYin Spark Flow Schedule Run
+name: DouYin Spark Flow Manual Run
 
 permissions:
   contents: read
 
 on:
-  workflow_dispatch: # 允许手动触发
-  schedule: # 定时任务
-    - cron: "0 1 * * *" # 每天 1:00 UTC（对应北京时间 9:00）
+  # 服务器或 Docker 已有自己的定时器；默认只保留人工备用入口，防止两套调度在
+  # 同一时刻向相同好友重复发送。仅使用 Actions 部署时可按文档显式加回 schedule。
+  workflow_dispatch:
+
 jobs:
   run-main:
     timeout-minutes: 20
@@ -42,10 +43,3 @@ jobs:
         name: run-logs
         path: logs/
         retention-days: 3
-  workflow-keepalive:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    steps:
-      - uses: liskin/gh-workflow-keepalive@v1

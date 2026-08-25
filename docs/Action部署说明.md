@@ -2,7 +2,8 @@
 
 > 前提：确保您已获取到所有配置，详见：[【DouYinSparkFlow 配置生成器】使用说明](配置生成器使用.md)
 
-本项目已经预设Action配置，只需填写相关配置即可启用。
+本项目已经预设 Action 配置，但默认只允许手动触发。服务器 systemd 或 Docker
+已经负责定时执行时，不应再启用 Action 定时任务，否则同一批好友可能收到重复消息。
 
 ## 1. Fork 仓库
 
@@ -56,12 +57,13 @@
 
 ## 5. 修改执行时间（可选）
 
-如需调整自动执行时间，编辑仓库文件 `.github/workflows/schedule.yml`，找到下方配置：
+只有在 **仅使用 GitHub Actions、没有启用服务器或 Docker 定时器** 时，才应编辑
+`.github/workflows/schedule.yml`，在 `workflow_dispatch` 同级显式增加下方配置：
 
 ```yaml
 on:
   workflow_dispatch: # 允许手动触发
-  schedule: # 定时任务
+  schedule: # 仅供 Action 独占调度时启用
     - cron: "0 1 * * *" # 每天 1:00 UTC（对应北京时间 9:00）
 ```
 
@@ -70,6 +72,7 @@ on:
 注意事项：
 
 - GitHub Actions 的 `cron` 使用 UTC 时区，不是北京时间。
+- Action、服务器 systemd 和 Docker cron 三种调度方式只能选择一种保持启用。
 - 北京时间（UTC+8） = UTC 时间 + 8 小时。
 - 建议先手动触发一次工作流，确认配置无误后再依赖定时任务。
 
@@ -97,7 +100,8 @@ Cron 基础语法（5 段）：
 
 ## 6. 手动触发测试（可选）
 
-> 建议执行此步骤，可以验证配置是否达到预期，此外首次fork后也需要手动触发后续才会自动执行
+> 建议先执行此步骤验证配置。默认工作流只会在你主动触发时运行；只有按上一节
+> 显式加入 `schedule` 后才会自动执行。
 
 仓库的工作流中添加了`workflow_dispatch`以便允许进行手动触发，在初次配置完成后可以通过手动触发Action来进行验证，操作方式如下图所示：
 
