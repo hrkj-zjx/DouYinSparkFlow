@@ -20,6 +20,45 @@ TEST_CONFIG = {
 }
 
 
+def make_authority_raw(
+    size,
+    *,
+    has_more=False,
+    sdk_is_loading=False,
+    store_is_loading=False,
+    ordered_ids=None,
+    participant_sec_user_ids=None,
+):
+    """构造不含真实账号数据的权威状态原始值。"""
+
+    ids = ordered_ids if ordered_ids is not None else [
+        f"合成会话ID-{index}" for index in range(size)
+    ]
+    participant_ids = participant_sec_user_ids if participant_sec_user_ids is not None else [
+        f"合成参与者sec_uid-{index}" for index in range(size)
+    ]
+    return {
+        "hasMore": has_more,
+        "sdkIsLoading": sdk_is_loading,
+        "storeIsLoading": store_is_loading,
+        "orderedIds": list(ids),
+        "participantSecUserIds": list(participant_ids),
+    }
+
+
+def make_authority_snapshot(size, **kwargs):
+    """通过生产校验后的字段形状构造冻结快照，供 proof 传播测试使用。"""
+
+    raw = make_authority_raw(size, **kwargs)
+    return tasks.ConversationAuthoritySnapshot(
+        has_more=raw["hasMore"],
+        sdk_is_loading=raw["sdkIsLoading"],
+        store_is_loading=raw["storeIsLoading"],
+        ordered_ids=tuple(raw["orderedIds"]),
+        participant_sec_user_ids=tuple(raw["participantSecUserIds"]),
+    )
+
+
 class DelayedResponse:
     """第一次读取失败、第二次返回数据，用于模拟响应体延迟。"""
 
@@ -139,6 +178,9 @@ class FakeChatInput:
         self.clear_after_enter = clear_after_enter
         self.element_count = element_count
         self.placeholder_text = placeholder_text
+        self.owner_page = None
+        self.before_enter_hook = None
+        self.last_guard_script = None
 
     def count(self):
         # Playwright Locator 的 count 用于证明页面里只有一个真实可编辑节点。
@@ -159,12 +201,40 @@ class FakeChatInput:
         self.actions.append(("type", value))
         self.text += value
 
+    def evaluate(self, expression, expected=None):
+        """模拟在同一编辑器元素上安装 window capture Enter 守卫。"""
+
+        if "installEnterAuthorityGuard" not in expression:
+            raise AssertionError("未预期的编辑器 evaluate 脚本")
+        self.last_guard_script = expression
+        if self.owner_page is None:
+            raise AssertionError("测试编辑器尚未绑定页面，无法安装 Enter 守卫")
+        return self.owner_page.install_fake_enter_guard(self, expected)
+
     def press(self, value):
         self.actions.append(("press", value))
         if value == "Shift+Enter":
             self.text += "\n"
-        elif value == "Enter" and self.clear_after_enter:
-            self.text = ""
+        elif value == "Enter":
+            # hook 精确位于 Python 最后 proof 已返回、真实 keydown capture 即将运行
+            # 的窗口，用来复现仅靠 press 前检查无法封住的 authority 竞态。
+            if self.before_enter_hook is not None:
+                hook = self.before_enter_hook
+                self.before_enter_hook = None
+                hook()
+            keydown_allowed = (
+                self.owner_page is None
+                or self.owner_page.dispatch_fake_enter_phase("keydown", self)
+            )
+            # 站点若使用 keydown 发送，会在同一事件传播内先于后续相位处理；只有
+            # 最早 capture 已明确 allowed 时，fake 才模拟这一清空副作用。
+            if keydown_allowed and self.clear_after_enter:
+                self.text = ""
+            if self.owner_page is not None:
+                # 真实 Chromium 即使 keydown 被阻断仍会产生 keyup。fake 显式派发
+                # 全部潜在 Enter 相位，验证预装门禁不会让站点改用 keyup 绕过。
+                for phase in ("keypress", "beforeinput", "keyup"):
+                    self.owner_page.dispatch_fake_enter_phase(phase, self)
 
 
 class FakeTextLocator:
@@ -205,6 +275,10 @@ class FakeConversationItem:
         self.clicked = False
         self.click_count = 0
         self.active = False
+        self.authority_page = None
+        self.connected = True
+        self.actionable = True
+        self.last_evaluate_expression = None
 
     def locator(self, selector):
         if selector == tasks.CONVERSATION_TITLE_SELECTOR:
@@ -218,6 +292,39 @@ class FakeConversationItem:
         self.click_count += 1
         if self.activate_on_click:
             self.active = True
+
+    def evaluate(self, expression, expected=None):
+        """模拟只读几何探针与生产原子点击边界。"""
+
+        if "conversationItemIsActionableInList" in expression:
+            # 搜索阶段只能把已经进入列表容器可交互区域的 DOM 项设为候选。
+            # ``actionable`` 可由测试在不同虚拟窗口分别设置，以复现 overscan。
+            return self.connected and self.actionable
+
+        if "clickAtAuthoritativeConversationBoundary" not in expression:
+            raise AssertionError("未预期的会话项 evaluate 脚本")
+        self.last_evaluate_expression = expression
+        if self.authority_page is None:
+            return "AUTHORITY_BOUNDARY_REJECTED"
+        current = self.authority_page.current_authority_raw
+        expected_raw = {
+            "hasMore": expected["hasMore"],
+            "sdkIsLoading": expected["sdkIsLoading"],
+            "storeIsLoading": expected["storeIsLoading"],
+            "orderedIds": expected["orderedIds"],
+            "participantSecUserIds": expected["participantSecUserIds"],
+        }
+        if (
+            not self.connected
+            or not self.actionable
+            or self.stable_index != expected["stableIndex"]
+            or tasks._normalize_identity_value(self.display_name)
+            != expected["displayName"]
+            or current != expected_raw
+        ):
+            return "AUTHORITY_BOUNDARY_REJECTED"
+        self.click()
+        return "AUTHORITY_BOUNDARY_CLICKED"
 
     def get_attribute(self, attribute_name, timeout=None):
         if attribute_name != "class":
@@ -236,6 +343,7 @@ class FakePage:
         chat_input=None,
         goto_error=None,
         right_title="确认好友",
+        authority_raw=None,
     ):
         self.chat_input = chat_input or FakeChatInput()
         self.goto_error = goto_error
@@ -245,11 +353,26 @@ class FakePage:
         self.waited_milliseconds = []
         self.goto_urls = []
         self.goto_options = []
+        self.authority_raw = authority_raw or make_authority_raw(1)
+        self.evaluated_expressions = []
+        self.enter_guard = None
+        self.enter_guard_cleanup_count = 0
+        self.enter_capture_gate_preinstalled = False
+        self.enter_gate_status = tasks.ENTER_AUTHORITY_GUARD_DISARMED
+        self.enter_phase_events = []
+        self.blocked_enter_phases = []
+        self.lifecycle_events = []
+        self.chat_input.owner_page = self
+
+    @property
+    def current_authority_raw(self):
+        return dict(self.authority_raw)
 
     def on(self, event_name, callback):
         self.events[event_name] = callback
 
     def goto(self, url, **options):
+        self.lifecycle_events.append("goto")
         self.goto_urls.append(url)
         self.goto_options.append(options)
         if self.goto_error is not None:
@@ -260,6 +383,100 @@ class FakePage:
 
     def wait_for_timeout(self, milliseconds):
         self.waited_milliseconds.append(milliseconds)
+
+    def install_fake_enter_guard(self, editor, expected):
+        """仅保存合成 proof；真正放行判断延迟到 fake keydown 时同步执行。"""
+
+        if (
+            not self.enter_capture_gate_preinstalled
+            or self.enter_guard is not None
+            or self.enter_gate_status != tasks.ENTER_AUTHORITY_GUARD_DISARMED
+            or editor is not self.chat_input
+        ):
+            return "ENTER_AUTHORITY_GUARD_SETUP_ERROR"
+        expected_authority = {
+            "hasMore": expected["hasMore"],
+            "sdkIsLoading": expected["sdkIsLoading"],
+            "storeIsLoading": expected["storeIsLoading"],
+            "orderedIds": expected["orderedIds"],
+            "participantSecUserIds": expected["participantSecUserIds"],
+        }
+        if self.current_authority_raw != expected_authority:
+            return "ENTER_AUTHORITY_GUARD_SETUP_ERROR"
+        self.enter_guard = {
+            "editor": editor,
+            "expected": expected,
+        }
+        self.enter_gate_status = tasks.ENTER_AUTHORITY_GUARD_ARMED
+        return tasks.ENTER_AUTHORITY_GUARD_ARMED
+
+    def dispatch_fake_enter_phase(self, phase, editor):
+        """模拟最早 capture 对 keydown 及 Chromium 后续 Enter 相位的处理。"""
+
+        self.enter_phase_events.append(phase)
+        if not self.enter_capture_gate_preinstalled:
+            return True
+        if phase != "keydown":
+            # 经过验证的 keydown 是唯一允许传播的发送相位；keypress、beforeinput
+            # 与 keyup 全部阻断，避免站点通过另一相位重复或绕过提交。
+            self.blocked_enter_phases.append(phase)
+            return False
+        if (
+            self.enter_guard is None
+            or self.enter_gate_status != tasks.ENTER_AUTHORITY_GUARD_ARMED
+        ):
+            self.enter_gate_status = tasks.ENTER_AUTHORITY_GUARD_BLOCKED
+            self.blocked_enter_phases.append(phase)
+            return False
+        expected = self.enter_guard["expected"]
+        expected_authority = {
+            "hasMore": expected["hasMore"],
+            "sdkIsLoading": expected["sdkIsLoading"],
+            "storeIsLoading": expected["storeIsLoading"],
+            "orderedIds": expected["orderedIds"],
+            "participantSecUserIds": expected["participantSecUserIds"],
+        }
+        allowed = (
+            editor is self.enter_guard["editor"]
+            and editor is self.chat_input
+            and editor.count() == 1
+            and self.right_title.count() == 1
+            and tasks._normalize_identity_value(self.right_title.text)
+            == expected["displayName"]
+            and self.current_authority_raw == expected_authority
+        )
+        self.enter_gate_status = (
+            tasks.ENTER_AUTHORITY_GUARD_ALLOWED
+            if allowed
+            else tasks.ENTER_AUTHORITY_GUARD_BLOCKED
+        )
+        if not allowed:
+            self.blocked_enter_phases.append(phase)
+        return allowed
+
+    def dispatch_fake_enter_keydown(self, editor):
+        """保留旧测试入口，实际统一走完整 Enter 相位模型。"""
+
+        return self.dispatch_fake_enter_phase("keydown", editor)
+
+    def consume_fake_enter_guard_status(self):
+        """模拟 finally cleanup：状态只读一次，随后清除页面私有守卫。"""
+
+        if not self.enter_capture_gate_preinstalled:
+            return "ENTER_AUTHORITY_GUARD_STATUS_MISSING"
+        status = self.enter_gate_status
+        self.enter_guard = None
+        self.enter_gate_status = tasks.ENTER_AUTHORITY_GUARD_DISARMED
+        self.enter_guard_cleanup_count += 1
+        return status
+
+    def evaluate(self, expression, ignored_handle=None):
+        self.evaluated_expressions.append(expression)
+        if "consumeEnterAuthorityGuardStatus" in expression:
+            return self.consume_fake_enter_guard_status()
+        if "readAuthoritativeConversationSnapshot" in expression:
+            return self.current_authority_raw
+        raise AssertionError(f"测试未预期访问页面脚本：{expression}")
 
     def locator(self, selector):
         if selector == tasks.CHAT_EDITOR_SELECTOR:
@@ -280,6 +497,8 @@ class FakeContext:
         self.cookies = None
         self.navigation_timeout = None
         self.default_timeout = None
+        self.init_scripts = []
+        self.lifecycle_events = self.page.lifecycle_events
 
     def set_default_navigation_timeout(self, value):
         self.navigation_timeout = value
@@ -290,7 +509,16 @@ class FakeContext:
     def route(self, pattern, handler):
         self.routes.append((pattern, handler))
 
+    def add_init_script(self, script=None, path=None):
+        if path is not None or not isinstance(script, str):
+            raise AssertionError("测试只接受内联 context init script")
+        self.lifecycle_events.append("add_init_script")
+        self.init_scripts.append(script)
+
     def new_page(self):
+        self.lifecycle_events.append("new_page")
+        self.page.enter_capture_gate_preinstalled = bool(self.init_scripts)
+        self.page.enter_gate_status = tasks.ENTER_AUTHORITY_GUARD_DISARMED
         return self.page
 
     def add_cookies(self, cookies):
@@ -372,6 +600,12 @@ class DelayedIdentityScrollPage:
         self.element = FakeConversationItem("延迟好友")
         self.scroll_handle = object()
         self.scroll_top = 0
+        self.authority_raw = make_authority_raw(1)
+        self.element.authority_page = self
+
+    @property
+    def current_authority_raw(self):
+        return dict(self.authority_raw)
 
     def locator(self, selector):
         if selector == tasks.CONVERSATION_ITEM_SELECTOR:
@@ -382,8 +616,10 @@ class DelayedIdentityScrollPage:
             return FakeTextLocator("延迟好友")
         raise AssertionError(f"未预期的列表选择器：{selector}")
 
-    def evaluate(self, expression, ignored_handle):
+    def evaluate(self, expression, ignored_handle=None):
         # 单页列表从一开始就位于底部；同时支持生产代码的回顶表达式。
+        if "readAuthoritativeConversationSnapshot" in expression:
+            return self.current_authority_raw
         if "scrollTop:" in expression:
             return {"scrollTop": 0, "clientHeight": 100, "scrollHeight": 100}
         if "scrollTop = 0" in expression:
@@ -396,7 +632,7 @@ class DelayedIdentityScrollPage:
             tasks.FriendIdentity(
                 short_id="",
                 unique_id="延迟标识",
-                sec_uid="",
+                sec_uid="合成参与者sec_uid-0",
                 nickname="延迟好友",
                 remark_name="延迟好友",
             )
@@ -423,7 +659,7 @@ class FakeConversationListPage:
         def count(self):
             return 1
 
-    def __init__(self, elements, right_title, *, pages=None):
+    def __init__(self, elements, right_title, *, pages=None, authority_raw=None):
         # 单页调用保持简洁；多页用 pages 显式模拟后续虚拟页，确保首屏不会看到
         # 后页元素，正好覆盖“先发送、后发现同名”的历史风险。
         self.pages = pages if pages is not None else [elements]
@@ -432,6 +668,18 @@ class FakeConversationListPage:
         self.scroll_top = 0
         self.client_height = 100
         self.waited_milliseconds = []
+        stable_indices = [
+            item.stable_index
+            for page_items in self.pages
+            for item in page_items
+            if item.stable_index is not None
+        ]
+        authority_size = max(stable_indices) + 1 if stable_indices else 1
+        self.authority_raw = authority_raw or make_authority_raw(authority_size)
+
+    @property
+    def current_authority_raw(self):
+        return dict(self.authority_raw)
 
     @property
     def visible_elements(self):
@@ -443,6 +691,10 @@ class FakeConversationListPage:
 
     def locator(self, selector):
         if selector == tasks.CONVERSATION_ITEM_SELECTOR:
+            for item in self.visible_elements:
+                # 多目标重排测试会在生成器暂停后替换 pages；每次取 locator 时重新
+                # 绑定 owner，保证新建的 fake 项也能执行原子 authority 点击门禁。
+                item.authority_page = self
             return self.ItemsLocator(self.visible_elements)
         if selector == tasks.CONVERSATION_LIST_SELECTOR:
             return self.ScrollLocator(self.scroll_handle)
@@ -450,8 +702,10 @@ class FakeConversationListPage:
             return self.right_title
         raise AssertionError(f"未预期的列表选择器：{selector}")
 
-    def evaluate(self, expression, ignored_handle):
+    def evaluate(self, expression, ignored_handle=None):
         scroll_height = self.client_height * len(self.pages)
+        if "readAuthoritativeConversationSnapshot" in expression:
+            return self.current_authority_raw
         if "scrollTop:" in expression:
             return {
                 "scrollTop": self.scroll_top,
@@ -460,6 +714,11 @@ class FakeConversationListPage:
             }
         if "scrollTop = 0" in expression:
             self.scroll_top = 0
+            return self.scroll_top
+        if "requestAnimationFrame" in expression:
+            # 生产代码在底部做一次轻微上移再回底的无副作用触碰。普通 fake 不
+            # 模拟动画帧，只需保留“最终回到当前底部”这一安全后置条件。
+            self.scroll_top = scroll_height - self.client_height
             return self.scroll_top
         if "Math.min" in expression:
             # 生产代码传入 [handle, step]；fake 只使用步长并模拟浏览器的最大滚动值。
@@ -475,7 +734,519 @@ class FakeConversationListPage:
         self.waited_milliseconds.append(milliseconds)
 
 
+class ScriptedInventoryPage:
+    """按独立 pass 提供库存快照，用于复现线上分批懒加载。
+
+    页面始终建模为单视口底部，因此测试聚焦于两层稳定性协议，而不重复验证滚动
+    容器几何。每次生产代码执行“验证回顶”就进入下一个脚本 pass；最终成功后的
+    回顶会被钳制到最后一份脚本，不改变已经返回的库存。所有项目都是真实的
+    ``FakeConversationItem``，便于统一断言验收完成或失败前 click_count 始终为零。
+    """
+
+    class ItemsLocator:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def all(self):
+            return self.owner.current_items
+
+    class ScrollLocator:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def element_handle(self):
+            return self.handle
+
+        def count(self):
+            return 1
+
+    def __init__(
+        self,
+        pass_sizes,
+        *,
+        append_after_bottom_wait=None,
+        authority_states=None,
+        authority_error=None,
+    ):
+        if not pass_sizes:
+            raise ValueError("测试脚本至少需要一个 pass")
+        self.pass_items = [
+            [
+                FakeConversationItem(
+                    f"脚本好友-{stable_index}",
+                    stable_index=stable_index,
+                )
+                for stable_index in range(size)
+            ]
+            for size in pass_sizes
+        ]
+        self.all_items = [
+            item for items in self.pass_items for item in items
+        ]
+        self.scroll_handle = object()
+        self.pass_index = -1
+        self.awaiting_reset_wait = False
+        self.bottom_wait_count = 0
+        self.append_after_bottom_wait = append_after_bottom_wait
+        self.appended_item = None
+        self.authority_states = authority_states
+        self.authority_error = authority_error
+        self.authority_read_count = 0
+
+    @property
+    def current_items(self):
+        return self.pass_items[max(self.pass_index, 0)]
+
+    @property
+    def current_authority_raw(self):
+        if self.authority_error is not None:
+            raise self.authority_error
+        if self.authority_states is None:
+            return make_authority_raw(len(self.current_items))
+        state = self.authority_states[
+            min(max(self.pass_index, 0), len(self.authority_states) - 1)
+        ]
+        return dict(state)
+
+    def locator(self, selector):
+        if selector == tasks.CONVERSATION_ITEM_SELECTOR:
+            for item in self.current_items:
+                item.authority_page = self
+            return self.ItemsLocator(self)
+        if selector == tasks.CONVERSATION_LIST_SELECTOR:
+            return self.ScrollLocator(self.scroll_handle)
+        raise AssertionError(f"未预期的脚本库存选择器：{selector}")
+
+    def evaluate(self, expression, ignored_handle=None):
+        if "readAuthoritativeConversationSnapshot" in expression:
+            self.authority_read_count += 1
+            return self.current_authority_raw
+        if "scrollTop:" in expression:
+            return {"scrollTop": 0, "clientHeight": 100, "scrollHeight": 100}
+        if "scrollTop = 0" in expression:
+            # 每个独立 pass 都必须从受验证的回顶动作开始。最后一次成功回顶也会
+            # 进入这里，因此索引钳制到末尾，避免读取脚本范围之外的数据。
+            self.pass_index = min(self.pass_index + 1, len(self.pass_items) - 1)
+            self.awaiting_reset_wait = True
+            self.bottom_wait_count = 0
+            return 0
+        raise AssertionError(f"未预期的脚本库存脚本：{expression}")
+
+    def wait_for_timeout(self, ignored_milliseconds):
+        if self.awaiting_reset_wait:
+            # _reset_list_to_top 自带一次布局等待；它不是底部稳定快照之间的等待，
+            # 不应提前触发专门为第二个底部等待安排的慢追加。
+            self.awaiting_reset_wait = False
+            return
+        self.bottom_wait_count += 1
+        if (
+            self.append_after_bottom_wait is not None
+            and self.appended_item is None
+            and self.bottom_wait_count == self.append_after_bottom_wait
+        ):
+            # 在第二个底部等待后追加，能证明“三快照”要求不会像旧两快照逻辑那样
+            # 在追加发生前返回。新增项会永久保留到后续独立 pass。
+            stable_index = len(self.current_items)
+            self.appended_item = FakeConversationItem(
+                f"脚本好友-{stable_index}",
+                stable_index=stable_index,
+            )
+            for pass_items in self.pass_items[self.pass_index :]:
+                pass_items.append(self.appended_item)
+            self.all_items.append(self.appended_item)
+
+
+class DelayedTerminalInventoryPage(ScriptedInventoryPage):
+    """先连续观察两次 45 项非终态，再切换到 150 项权威终态。"""
+
+    def __init__(self):
+        super().__init__([45, 150, 150])
+        self.terminal_reached = False
+        self.bottom_observations = []
+
+    @property
+    def current_authority_raw(self):
+        size = 150 if self.terminal_reached else 45
+        return make_authority_raw(size, has_more=not self.terminal_reached)
+
+    def wait_for_timeout(self, ignored_milliseconds):
+        if self.awaiting_reset_wait:
+            super().wait_for_timeout(ignored_milliseconds)
+            return
+        self.bottom_observations.append(
+            (len(self.current_authority_raw["orderedIds"]), self.current_authority_raw["hasMore"])
+        )
+        if len(self.bottom_observations) == 2:
+            # 两次完全相同的 45 项 DOM/authority 观察仍是 hasMore=true，不能早退。
+            # 切换 authority 后生产代码必须丢弃旧库存、回顶，再读取 150 项 DOM。
+            self.terminal_reached = True
+        super().wait_for_timeout(ignored_milliseconds)
+
+
+class MidScanAuthorityChangePage(ScriptedInventoryPage):
+    """在第一个可见窗口读完后切换 authority，验证旧库存不会混入新 pass。"""
+
+    def __init__(self):
+        super().__init__([1, 1, 1])
+        self.pass_items[0][0].display_name = "旧顺序标题"
+        self.pass_items[1][0].display_name = "新顺序标题"
+        self.pass_items[2][0].display_name = "新顺序标题"
+        self.authority_read_count = 0
+        self.switched = False
+
+    @property
+    def current_authority_raw(self):
+        ordered_ids = ["新权威ID"] if self.switched else ["旧权威ID"]
+        return make_authority_raw(1, ordered_ids=ordered_ids)
+
+    def evaluate(self, expression, ignored_handle=None):
+        if "readAuthoritativeConversationSnapshot" in expression:
+            self.authority_read_count += 1
+            # 调用顺序为：初始 proof、窗口前 proof、窗口后 proof。第三次读取才切换，
+            # 正好验证临时窗口已经读取但尚未合并时的竞态处理。
+            if self.authority_read_count == 3:
+                self.switched = True
+            return self.current_authority_raw
+        return super().evaluate(expression, ignored_handle)
+
+
 class TaskReliabilityTests(unittest.TestCase):
+    def test_authority_participant_strong_id_selects_offscreen_same_name(self):
+        """同名 DOM 不影响 sec_uid join；强标识只授权对应 participant 索引。"""
+
+        selected_identity = tasks.FriendIdentity(
+            "短号甲", "强抖音号甲", "sec甲", "同名好友", "同名好友"
+        )
+        other_identity = tasks.FriendIdentity(
+            "短号乙", "强抖音号乙", "sec乙", "同名好友", "同名好友"
+        )
+        authority = make_authority_snapshot(
+            2,
+            participant_sec_user_ids=["sec甲", "sec乙"],
+        )
+
+        plan = tasks._build_unique_selection_plan(
+            {0: "同名好友", 1: "同名好友"},
+            ["强抖音号甲", "同名好友"],
+            {"同名好友": {selected_identity, other_identity}},
+            authority=authority,
+        )
+
+        self.assertEqual(set(plan), {0})
+        self.assertEqual(
+            plan[0].match.covered_targets,
+            ("强抖音号甲", "同名好友"),
+        )
+
+    def test_authority_participant_rejects_nickname_only_group(self):
+        """即使 participant 可 join，没有强标识锚点的纯昵称配置仍须失败。"""
+
+        identity = tasks.FriendIdentity(
+            "短号甲", "强抖音号甲", "sec甲", "昵称甲", "昵称甲"
+        )
+        with self.assertRaises(tasks.ConversationSelectionError):
+            tasks._build_unique_selection_plan(
+                {0: "昵称甲"},
+                ["昵称甲"],
+                {"昵称甲": {identity}},
+                authority=make_authority_snapshot(
+                    1,
+                    participant_sec_user_ids=["sec甲"],
+                ),
+            )
+
+    def test_participant_change_after_snapshot_blocks_atomic_click(self):
+        """remote proof 后 participant 顺序变化时，原子边界必须保持零点击。"""
+
+        proof = make_authority_snapshot(
+            2,
+            participant_sec_user_ids=["sec甲", "sec乙"],
+        )
+        item = FakeConversationItem("目标好友", stable_index=0)
+        page = FakeConversationListPage(
+            [item, FakeConversationItem("其他好友", stable_index=1)],
+            right_title="目标好友",
+            authority_raw=make_authority_raw(
+                2,
+                participant_sec_user_ids=["sec乙", "sec甲"],
+            ),
+        )
+        item.authority_page = page
+
+        with self.assertRaises(tasks.ConversationSelectionError):
+            tasks._click_conversation_at_authority_boundary(
+                item,
+                0,
+                "目标好友",
+                proof,
+            )
+
+        self.assertEqual(item.click_count, 0)
+
+    def test_inventory_waits_for_consecutive_full_passes_after_partial_first_pass(self):
+        """45、45 两份非终态不能早退，150、150 终态才允许返回。"""
+
+        page = DelayedTerminalInventoryPage()
+
+        inventory, returned_handle, proof = tasks._scan_full_conversation_inventory(
+            page,
+            friend_list_wait_time=1,
+        )
+
+        self.assertEqual(len(inventory), 150)
+        self.assertEqual(len(proof.ordered_ids), 150)
+        self.assertIs(returned_handle, page.scroll_handle)
+        self.assertEqual(page.pass_index, 2)
+        self.assertEqual(page.bottom_observations[:2], [(45, True), (45, True)])
+        self.assertIn((150, False), page.bottom_observations)
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_inventory_fails_closed_when_four_full_passes_never_match(self):
+        """四个 pass 的完整映射始终变化时，达到上限也不能接受任一快照。"""
+
+        page = ScriptedInventoryPage([1, 2, 3, 4])
+
+        with self.assertRaises(tasks.ConversationSelectionError):
+            tasks._scan_full_conversation_inventory(
+                page,
+                friend_list_wait_time=1,
+            )
+
+        self.assertEqual(page.pass_index, tasks.MAX_INVENTORY_SCAN_PASSES - 1)
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_stable_short_inventory_passes_two_independent_scans_without_click(self):
+        """确实稳定的短列表仍可通过，但扫描层自身始终不得触发点击。"""
+
+        page = ScriptedInventoryPage([3, 3])
+
+        inventory, _, proof = tasks._scan_full_conversation_inventory(
+            page,
+            friend_list_wait_time=1,
+        )
+
+        self.assertEqual(len(inventory), 3)
+        self.assertTrue(proof.is_terminal)
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_slow_bottom_append_before_third_snapshot_is_included(self):
+        """第二个等待后才追加的项目必须打断稳定计数并进入最终库存。"""
+
+        page = ScriptedInventoryPage(
+            [2, 2],
+            append_after_bottom_wait=2,
+        )
+
+        inventory, _, proof = tasks._scan_full_conversation_inventory(
+            page,
+            friend_list_wait_time=1,
+        )
+
+        self.assertIsNotNone(page.appended_item)
+        self.assertEqual(len(inventory), 3)
+        self.assertEqual(len(proof.ordered_ids), 3)
+        self.assertIn(2, inventory)
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_authority_snapshot_hides_ids_from_repr(self):
+        """冻结 proof 可比较完整顺序，但 repr 不得泄露服务端会话 ID。"""
+
+        proof = make_authority_snapshot(
+            1,
+            ordered_ids=["不应出现在repr中的合成ID"],
+        )
+
+        self.assertNotIn("不应出现在repr中的合成ID", repr(proof))
+        self.assertTrue(proof.is_terminal)
+
+    def test_authority_scripts_follow_live_remote_factory_shape(self):
+        """锁定线上已确认的 remote.get('.') -> factory() 解析顺序。"""
+
+        page = FakePage()
+        proof = tasks._read_authoritative_conversation_snapshot(page)
+        reader_script = page.evaluated_expressions[-1]
+        self.assertIn('await remote.get(".")', reader_script)
+        self.assertIn("const exportsObject = factory()", reader_script)
+        self.assertIn("exportsObject.Context", reader_script)
+        self.assertIn('"initLinkInstance"', reader_script)
+        self.assertIn("link.isLoading", reader_script)
+
+        item = FakeConversationItem("工厂形状目标", stable_index=0)
+        list_page = FakeConversationListPage(
+            [item],
+            right_title="工厂形状目标",
+        )
+        item.authority_page = list_page
+        tasks._click_conversation_at_authority_boundary(
+            item,
+            0,
+            "工厂形状目标",
+            proof,
+        )
+        click_script = item.last_evaluate_expression
+        self.assertIn('await remote.get(".")', click_script)
+        self.assertLess(
+            click_script.index('await remote.get(".")'),
+            click_script.index("nextParams.hasMore"),
+        )
+        self.assertNotIn("await", click_script[click_script.index("nextParams.hasMore") :])
+        self.assertIn("Number.isSafeInteger(expected.stableIndex)", click_script)
+        self.assertIn("element.ownerDocument !== document", click_script)
+        self.assertIn("element.matches(", click_script)
+        self.assertIn("HTMLElement.prototype.click.call(element)", click_script)
+
+    def test_authority_reader_rejects_wrong_types_duplicate_or_empty_ids(self):
+        """权威字段必须严格为 bool 与非空、全局唯一的字符串有序列表。"""
+
+        invalid_states = {
+            "hasMore 不是 bool": {
+                **make_authority_raw(1),
+                "hasMore": 0,
+            },
+            "loading 不是 bool": {
+                **make_authority_raw(1),
+                "sdkIsLoading": "false",
+            },
+            "ID 重复": make_authority_raw(
+                2,
+                ordered_ids=["合成机密ID", "合成机密ID"],
+            ),
+            "ID 为空": make_authority_raw(1, ordered_ids=["   "]),
+        }
+
+        for label, raw_state in invalid_states.items():
+            with self.subTest(label=label):
+                page = FakePage(authority_raw=raw_state)
+                with self.assertRaises(tasks.ConversationSelectionError) as caught:
+                    tasks._read_authoritative_conversation_snapshot(page)
+                self.assertNotIn("合成机密ID", str(caught.exception))
+
+    def test_authority_evaluate_exception_is_redacted_and_fails_closed(self):
+        """页面 evaluate 异常正文不能泄漏，且不得降级为 DOM-only 扫描。"""
+
+        page = ScriptedInventoryPage(
+            [1],
+            authority_error=RuntimeError("页面异常中含合成机密ID"),
+        )
+
+        with self.assertRaises(tasks.ConversationSelectionError) as caught:
+            tasks._read_authoritative_conversation_snapshot(page)
+
+        self.assertNotIn("合成机密ID", str(caught.exception))
+
+    def test_same_inventory_with_has_more_true_never_authorizes_click(self):
+        """四次乃至更多相同 DOM 在 hasMore=true 时仍不是权威终态。"""
+
+        item = FakeConversationItem("非终态目标", stable_index=0)
+        page = ScriptedInventoryPage(
+            [1],
+            authority_states=[make_authority_raw(1, has_more=True)],
+        )
+        page.pass_items[0][0] = item
+        page.all_items = [item]
+
+        with patch.object(tasks, "MAX_INVENTORY_SCAN_ROUNDS", 8):
+            with self.assertRaises(tasks.ConversationSelectionError):
+                tasks._scan_full_conversation_inventory(page, friend_list_wait_time=1)
+
+        self.assertGreaterEqual(page.authority_read_count, 4)
+        self.assertEqual(item.click_count, 0)
+
+    def test_loading_authority_never_authorizes_inventory(self):
+        """SDK 或 store 任一仍 loading 时都不能读取中间态库存。"""
+
+        for loading_field in ("sdkIsLoading", "storeIsLoading"):
+            with self.subTest(loading_field=loading_field):
+                raw_state = make_authority_raw(1)
+                raw_state[loading_field] = True
+                page = ScriptedInventoryPage(
+                    [1],
+                    authority_states=[raw_state],
+                )
+                with patch.object(tasks, "MAX_INVENTORY_SCAN_ROUNDS", 5):
+                    with self.assertRaises(tasks.ConversationSelectionError):
+                        tasks._scan_full_conversation_inventory(
+                            page,
+                            friend_list_wait_time=1,
+                        )
+                self.assertTrue(
+                    all(item.click_count == 0 for item in page.all_items)
+                )
+
+    def test_terminal_authority_rejects_dom_missing_one_index(self):
+        """150 项终态 authority 与仅 149 个 DOM 索引不能被稳定快照掩盖。"""
+
+        page = ScriptedInventoryPage(
+            [149],
+            authority_states=[make_authority_raw(150)],
+        )
+
+        with patch.object(tasks, "MAX_INVENTORY_SCAN_ROUNDS", 6):
+            with self.assertRaises(tasks.ConversationSelectionError):
+                tasks._scan_full_conversation_inventory(page, friend_list_wait_time=1)
+
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_mid_scan_authority_change_discards_old_index_mapping(self):
+        """窗口读取期间切换权威顺序后，最终库存只能包含新 pass 标题。"""
+
+        page = MidScanAuthorityChangePage()
+
+        inventory, _, proof = tasks._scan_full_conversation_inventory(
+            page,
+            friend_list_wait_time=1,
+        )
+
+        self.assertEqual(inventory, {0: "新顺序标题"})
+        self.assertEqual(proof.ordered_ids, ("新权威ID",))
+        self.assertNotIn("旧顺序标题", inventory.values())
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_two_passes_with_same_dom_but_different_id_order_never_match(self):
+        """DOM 映射相同也不能覆盖 authority ordered_ids 的顺序变化。"""
+
+        first_order = make_authority_raw(2, ordered_ids=["权威甲", "权威乙"])
+        second_order = make_authority_raw(2, ordered_ids=["权威乙", "权威甲"])
+        page = ScriptedInventoryPage(
+            [2, 2, 2, 2],
+            authority_states=[first_order, second_order, first_order, second_order],
+        )
+
+        with self.assertRaises(tasks.ConversationSelectionError):
+            tasks._scan_full_conversation_inventory(page, friend_list_wait_time=1)
+
+        self.assertEqual(page.pass_index, tasks.MAX_INVENTORY_SCAN_PASSES - 1)
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_final_reset_authority_change_invalidates_two_matching_passes(self):
+        """两次 pass 一致后，最终回顶若变序仍必须 fail-closed。"""
+
+        stable = make_authority_raw(2, ordered_ids=["权威甲", "权威乙"])
+        changed = make_authority_raw(2, ordered_ids=["权威乙", "权威甲"])
+        page = ScriptedInventoryPage(
+            [2, 2, 2],
+            authority_states=[stable, stable, changed],
+        )
+
+        with self.assertRaises(tasks.ConversationSelectionError):
+            tasks._scan_full_conversation_inventory(page, friend_list_wait_time=1)
+
+        self.assertEqual(page.pass_index, 2)
+        self.assertTrue(all(item.click_count == 0 for item in page.all_items))
+
+    def test_forward_inventory_scroll_uses_overlapping_viewports(self):
+        """前进步长保持三成视口，并由真实 scrollTop 变化证明已经推进。"""
+
+        page = FakeConversationListPage(
+            [],
+            right_title="未使用标题",
+            pages=[[], [], []],
+        )
+
+        tasks._scroll_list_forward(page, page.scroll_handle, page.client_height)
+
+        self.assertEqual(page.scroll_top, 30)
+
     def test_delayed_response_retries_and_empty_remark_falls_back_per_account(self):
         first_account_index = {}
         second_account_index = {}
@@ -572,7 +1343,7 @@ class TaskReliabilityTests(unittest.TestCase):
         identity = tasks.FriendIdentity(
             short_id="配置别名甲",
             unique_id="配置别名乙",
-            sec_uid="",
+            sec_uid="合成参与者sec_uid-0",
             nickname="唯一好友",
             remark_name="唯一好友",
         )
@@ -723,7 +1494,8 @@ class TaskReliabilityTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(identity_index.other_read_count, 2)
+        # participant 计划在建立时冻结身份，不再二次读取 mutable identity_index。
+        self.assertEqual(identity_index.other_read_count, 0)
         self.assertEqual(selected_item.click_count, 0)
         self.assertEqual(other_item.click_count, 0)
 
@@ -756,7 +1528,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(identity_index.read_count, 2)
+        self.assertEqual(identity_index.read_count, 0)
         self.assertEqual(item.click_count, 0)
 
     def test_identity_becoming_ambiguous_after_plan_aborts_before_click(self):
@@ -796,7 +1568,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(identity_index.read_count, 2)
+        self.assertEqual(identity_index.read_count, 0)
         self.assertFalse(item.clicked)
 
     def test_duplicate_normalized_titles_in_one_round_are_never_clicked(self):
@@ -812,7 +1584,7 @@ class TaskReliabilityTests(unittest.TestCase):
                     page,
                     "歧义账号",
                     ["同名 好友"],
-                    identity_index={},
+                    identity_index=None,
                     friend_list_wait_time=1,
                     confirmation_timeout=1,
                 )
@@ -826,10 +1598,16 @@ class TaskReliabilityTests(unittest.TestCase):
 
         first_page_item = FakeConversationItem("跨页同名", stable_index=0)
         later_page_item = FakeConversationItem("跨页同名", stable_index=1)
+        overlap_item = FakeConversationItem("跨页重叠锚点", stable_index=2)
         page = FakeConversationListPage(
             [],
             right_title="跨页同名",
-            pages=[[first_page_item], [later_page_item]],
+            # 两个虚拟窗口共享 index=2，符合生产 70% 视口重叠协议；同名目标仍
+            # 分处不同窗口，继续验证首次点击前的全局重名发现能力。
+            pages=[
+                [first_page_item, overlap_item],
+                [overlap_item, later_page_item],
+            ],
         )
 
         with self.assertRaises(tasks.ConversationSelectionError):
@@ -838,7 +1616,7 @@ class TaskReliabilityTests(unittest.TestCase):
                     page,
                     "跨页歧义账号",
                     ["跨页同名"],
-                    identity_index={},
+                    identity_index=None,
                     friend_list_wait_time=1,
                     confirmation_timeout=1,
                 )
@@ -846,6 +1624,7 @@ class TaskReliabilityTests(unittest.TestCase):
 
         self.assertFalse(first_page_item.clicked)
         self.assertFalse(later_page_item.clicked)
+        self.assertFalse(overlap_item.clicked)
 
     def test_missing_stable_index_aborts_inventory_before_click(self):
         """任何会话项缺少稳定 data-index 祖先时，库存都不能被视为完整。"""
@@ -859,13 +1638,107 @@ class TaskReliabilityTests(unittest.TestCase):
                     page,
                     "无索引账号",
                     ["无索引好友"],
-                    identity_index={},
+                    identity_index=None,
                     friend_list_wait_time=1,
                     confirmation_timeout=1,
                 )
             )
 
         self.assertFalse(item.clicked)
+
+    def test_overscan_target_waits_until_it_intersects_list_before_single_click(self):
+        """目标先仅存在于 overscan 时必须跳过，进入视口后才恰好点击一次。"""
+
+        first_visible_anchor = FakeConversationItem("首屏可见锚点", stable_index=0)
+        overscan_target = FakeConversationItem("overscan目标", stable_index=1)
+        overscan_target.actionable = False
+        visible_target = FakeConversationItem("overscan目标", stable_index=1)
+        second_visible_anchor = FakeConversationItem("后屏可见锚点", stable_index=2)
+        page = FakeConversationListPage(
+            [],
+            right_title="overscan目标",
+            pages=[
+                # index=1 在首屏 DOM 中但不与列表矩形相交；它仍参与库存一致性，
+                # 只是不能成为发送搜索的点击候选。
+                [first_visible_anchor, overscan_target],
+                # 滚动后同一稳定索引真正进入容器。两个窗口共享 index=1，也满足
+                # 生产扫描要求的重叠连续性证据。
+                [visible_target, second_visible_anchor],
+            ],
+        )
+
+        selections = list(
+            tasks.scroll_and_select_user(
+                page,
+                "overscan账号",
+                ["overscan目标"],
+                identity_index=None,
+                friend_list_wait_time=1,
+                confirmation_timeout=1,
+            )
+        )
+
+        self.assertEqual(len(selections), 1)
+        self.assertIs(selections[0].item, visible_target)
+        self.assertEqual(overscan_target.click_count, 0)
+        self.assertEqual(visible_target.click_count, 1)
+        self.assertEqual(
+            sum(
+                item.click_count
+                for item in (
+                    first_visible_anchor,
+                    overscan_target,
+                    visible_target,
+                    second_visible_anchor,
+                )
+            ),
+            1,
+        )
+
+    def test_authority_order_change_after_plan_aborts_before_click(self):
+        """计划完成后 ordered_ids 变序，即使目标仍在 index=0 也必须零点击。"""
+
+        target = FakeConversationItem("顺序竞态目标", stable_index=0)
+        other = FakeConversationItem("顺序竞态旁项", stable_index=1)
+        initial = make_authority_raw(2, ordered_ids=["权威目标", "权威旁项"])
+        changed = make_authority_raw(2, ordered_ids=["权威旁项", "权威目标"])
+        page = FakeConversationListPage(
+            [target, other],
+            right_title="顺序竞态目标",
+            authority_raw=initial,
+        )
+        original_builder = tasks._build_unique_selection_plan
+        build_calls = 0
+
+        def build_plan_then_reorder(*args, **kwargs):
+            nonlocal build_calls
+            result = original_builder(*args, **kwargs)
+            build_calls += 1
+            if build_calls == 1:
+                # 目标自己的 DOM index/title 刻意保持不变，只替换权威 ID 顺序，
+                # 确保拦截来自 proof 而不是候选项的局部标题检查。
+                page.authority_raw = changed
+            return result
+
+        with patch.object(
+            tasks,
+            "_build_unique_selection_plan",
+            side_effect=build_plan_then_reorder,
+        ):
+            with self.assertRaises(tasks.ConversationSelectionError):
+                list(
+                    tasks.scroll_and_select_user(
+                        page,
+                        "顺序竞态账号",
+                        ["顺序竞态目标"],
+                        identity_index=None,
+                        friend_list_wait_time=1,
+                        confirmation_timeout=1,
+                    )
+                )
+
+        self.assertEqual(target.click_count, 0)
+        self.assertEqual(other.click_count, 0)
 
     def test_click_requires_active_item_and_matching_right_title(self):
         """确认成功必须同时来自被点击元素的当前类与规范化后相同的右侧标题。"""
@@ -878,7 +1751,7 @@ class TaskReliabilityTests(unittest.TestCase):
                 page,
                 "确认账号",
                 ["目标 好友"],
-                identity_index={},
+                identity_index=None,
                 friend_list_wait_time=1,
                 confirmation_timeout=1,
             )
@@ -901,7 +1774,7 @@ class TaskReliabilityTests(unittest.TestCase):
             page,
             "重排账号",
             ["目标甲", "目标乙"],
-            identity_index={},
+            identity_index=None,
             friend_list_wait_time=1,
             confirmation_timeout=1,
         )
@@ -939,7 +1812,7 @@ class TaskReliabilityTests(unittest.TestCase):
                     page,
                     "确认失败账号",
                     ["目标好友"],
-                    identity_index={},
+                    identity_index=None,
                     friend_list_wait_time=1,
                     confirmation_timeout=1,
                 )
@@ -970,6 +1843,8 @@ class TaskReliabilityTests(unittest.TestCase):
             target_symbol="目标一",
             display_name="确认好友",
             item=selected_item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
         )
 
         with patch.object(tasks, "scroll_and_select_user", return_value=[selection]), patch.object(
@@ -996,8 +1871,34 @@ class TaskReliabilityTests(unittest.TestCase):
         self.assertEqual(chat_input.actions[-1], ("press", "Enter"))
         self.assertEqual(page.goto_options, [{"wait_until": "domcontentloaded"}])
         self.assertEqual(
+            context.lifecycle_events[:3],
+            ["add_init_script", "new_page", "goto"],
+        )
+        self.assertEqual(
             [action for action in chat_input.actions if action == ("press", "Shift+Enter")],
             [("press", "Shift+Enter"), ("press", "Shift+Enter")],
+        )
+
+    def test_preinstalled_gate_blocks_unarmed_enter_and_all_followup_phases(self):
+        """页面创建前预装门禁；未 arm Enter 的 keydown 到 keyup 均不能传播。"""
+
+        chat_input = FakeChatInput(initial_text="未授权草稿")
+        page = FakePage(chat_input=chat_input)
+        context = FakeContext(page)
+
+        tasks._preinstall_enter_capture_gate(context)
+        self.assertEqual(context.lifecycle_events, ["add_init_script"])
+        self.assertIs(context.new_page(), page)
+        chat_input.press("Enter")
+
+        self.assertEqual(chat_input.text, "未授权草稿")
+        self.assertEqual(
+            page.blocked_enter_phases,
+            ["keydown", "keypress", "beforeinput", "keyup"],
+        )
+        self.assertEqual(
+            context.lifecycle_events[:2],
+            ["add_init_script", "new_page"],
         )
 
     def test_alias_group_is_submitted_once_and_covers_both_requested_targets(self):
@@ -1014,6 +1915,8 @@ class TaskReliabilityTests(unittest.TestCase):
             display_name="确认好友",
             item=selected_item,
             covered_targets=("配置别名甲", "配置别名乙"),
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
         )
 
         with patch.object(
@@ -1047,7 +1950,13 @@ class TaskReliabilityTests(unittest.TestCase):
         browser = FakeBrowser(context)
         item = FakeConversationItem("确认好友")
         item.active = True
-        selection = tasks.ConfirmedConversation("目标一", "确认好友", item)
+        selection = tasks.ConfirmedConversation(
+            "目标一",
+            "确认好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
 
         def build_message_and_change_conversation():
             # 模拟一言 HTTP 请求阻塞期间右侧会话发生变化；返回后任何 type 都会
@@ -1076,6 +1985,214 @@ class TaskReliabilityTests(unittest.TestCase):
         self.assertEqual(chat_input.actions, [])
         self.assertTrue(context.closed)
 
+    def test_authority_change_after_typing_blocks_enter(self):
+        """消息已输入但 Enter 前 authority 变化时，绝不能按下发送键。"""
+
+        initial_raw = make_authority_raw(1, ordered_ids=["输入前权威ID"])
+        changed_raw = make_authority_raw(1, ordered_ids=["输入后权威ID"])
+        proof = make_authority_snapshot(1, ordered_ids=["输入前权威ID"])
+        chat_input = FakeChatInput()
+        page = FakePage(
+            chat_input=chat_input,
+            right_title="Enter竞态好友",
+            authority_raw=initial_raw,
+        )
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        item = FakeConversationItem("Enter竞态好友", stable_index=0)
+        item.active = True
+        item.authority_page = page
+        selection = tasks.ConfirmedConversation(
+            "Enter竞态目标",
+            "Enter竞态好友",
+            item,
+            stable_index=0,
+            authority_proof=proof,
+        )
+        original_typer = tasks._type_multiline_message
+
+        def type_then_change_authority(editor, message):
+            original_typer(editor, message)
+            # 类型动作已经发生，随后模拟 IM 顺序事件；Enter 前的第二次 authority
+            # 读取必须看到变化并保留未发送草稿，不能用旧 proof 执行副作用。
+            page.authority_raw = changed_raw
+
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            return_value=[selection],
+        ), patch.object(
+            tasks,
+            "_build_message",
+            return_value="只应输入、不应发送",
+        ), patch.object(
+            tasks,
+            "_type_multiline_message",
+            side_effect=type_then_change_authority,
+        ):
+            with self.assertRaises(tasks.ConversationSelectionError):
+                tasks.do_user_task(
+                    browser,
+                    "Enter竞态账号",
+                    [],
+                    ["Enter竞态目标"],
+                    runtime_config={**TEST_CONFIG, "browserTimeout": 1},
+                )
+
+        self.assertNotIn(("press", "Enter"), chat_input.actions)
+        self.assertTrue(any(action[0] == "type" for action in chat_input.actions))
+        self.assertTrue(context.closed)
+
+    def test_keydown_guard_blocks_authority_change_after_final_precheck(self):
+        """Python 终检返回后才变序，也必须由页面 capture guard 阻断 Enter。"""
+
+        initial_raw = make_authority_raw(1, ordered_ids=["守卫初始权威ID"])
+        changed_raw = make_authority_raw(1, ordered_ids=["守卫变化权威ID"])
+        proof = make_authority_snapshot(1, ordered_ids=["守卫初始权威ID"])
+        chat_input = FakeChatInput()
+        page = FakePage(
+            chat_input=chat_input,
+            right_title="守卫竞态好友",
+            authority_raw=initial_raw,
+        )
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        item = FakeConversationItem("守卫竞态好友", stable_index=0)
+        item.active = True
+        selection = tasks.ConfirmedConversation(
+            "守卫竞态目标",
+            "守卫竞态好友",
+            item,
+            stable_index=0,
+            authority_proof=proof,
+        )
+
+        # hook 只在 FakeChatInput.press("Enter") 已被调用、fake window capture 尚未
+        # 判定前运行，因此 Python 的所有 Enter 前双读 proof 都仍会看到初始顺序。
+        chat_input.before_enter_hook = lambda: setattr(
+            page,
+            "authority_raw",
+            changed_raw,
+        )
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            return_value=[selection],
+        ), patch.object(
+            tasks,
+            "_build_message",
+            return_value="守卫应保留但不得发送的草稿",
+        ):
+            with self.assertRaises(tasks.ConversationSelectionError):
+                tasks.do_user_task(
+                    browser,
+                    "守卫竞态账号",
+                    [],
+                    ["守卫竞态目标"],
+                    runtime_config={**TEST_CONFIG, "browserTimeout": 1},
+                )
+
+        # Playwright 层只尝试一次真实 press，但 capture guard 在站点处理器之前拒绝，
+        # 因此 fake 编辑器不会清空；状态已读取一次并在 finally 语义下完成清理。
+        self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
+        self.assertEqual(chat_input.text, "守卫应保留但不得发送的草稿")
+        self.assertEqual(page.enter_guard_cleanup_count, 1)
+        self.assertIsNone(page.enter_guard)
+        self.assertTrue(context.closed)
+        self.assertIn("keyup", page.blocked_enter_phases)
+        self.assertIn("keypress", page.blocked_enter_phases)
+
+        guard_script = chat_input.last_guard_script
+        self.assertIn('await remote.get(".")', guard_script)
+        self.assertIn("link.isLoading", guard_script)
+        self.assertIn("gate.arm(validator)", guard_script)
+        self.assertNotIn("addEventListener", guard_script)
+        self.assertIn("event.isTrusted", guard_script)
+        # remote factory 的 await 只能发生在安装阶段；keydown proof 到事件放行之间
+        # 不得再次让出事件循环。
+        self.assertNotIn("await", guard_script[guard_script.index("const validator") :])
+
+        init_script = context.init_scripts[0]
+        self.assertIn("preinstallEnterCaptureGate", init_script)
+        for phase in ("keydown", "keypress", "beforeinput", "keyup"):
+            self.assertIn(f'addEventListener("{phase}"', init_script)
+        self.assertIn("event.preventDefault()", init_script)
+        self.assertIn("event.stopImmediatePropagation()", init_script)
+
+    def test_do_user_task_rejects_missing_or_nonterminal_proof_before_editor(self):
+        """兼容构造或非终态 proof 都不得让真实发送路径静默退回 DOM-only。"""
+
+        cases = (
+            (
+                "缺少 proof",
+                tasks.ConfirmedConversation(
+                    "无证明目标",
+                    "确认好友",
+                    FakeConversationItem("确认好友", stable_index=0),
+                ),
+            ),
+            (
+                "proof 非终态",
+                tasks.ConfirmedConversation(
+                    "非终态目标",
+                    "确认好友",
+                    FakeConversationItem("确认好友", stable_index=0),
+                    stable_index=0,
+                    authority_proof=make_authority_snapshot(1, has_more=True),
+                ),
+            ),
+        )
+        for label, selection in cases:
+            with self.subTest(label=label):
+                selection.item.active = True
+                chat_input = FakeChatInput()
+                page = FakePage(chat_input=chat_input, right_title="确认好友")
+                context = FakeContext(page)
+                browser = FakeBrowser(context)
+                with patch.object(
+                    tasks,
+                    "scroll_and_select_user",
+                    return_value=[selection],
+                ), patch.object(tasks, "_build_message") as build_message:
+                    with self.assertRaises(tasks.ConversationSelectionError):
+                        tasks.do_user_task(
+                            browser,
+                            "证明门禁账号",
+                            [],
+                            [selection.target_symbol],
+                            runtime_config={**TEST_CONFIG, "browserTimeout": 1},
+                        )
+
+                build_message.assert_not_called()
+                self.assertEqual(chat_input.actions, [])
+                self.assertNotIn(
+                    (tasks.CHAT_EDITOR_SELECTOR, 1),
+                    page.waited_selectors,
+                )
+                self.assertTrue(context.closed)
+
+    def test_atomic_click_rejects_detached_or_hidden_item(self):
+        """DOM 原子点击不得绕过连接状态或 actionability 门禁。"""
+
+        proof = make_authority_snapshot(1)
+        for attribute in ("connected", "actionable"):
+            with self.subTest(attribute=attribute):
+                page = FakeConversationListPage(
+                    [FakeConversationItem("原子目标", stable_index=0)],
+                    right_title="原子目标",
+                )
+                item = page.pages[0][0]
+                item.authority_page = page
+                setattr(item, attribute, False)
+                with self.assertRaises(tasks.ConversationSelectionError):
+                    tasks._click_conversation_at_authority_boundary(
+                        item,
+                        0,
+                        "原子目标",
+                        proof,
+                    )
+                self.assertEqual(item.click_count, 0)
+
     def test_existing_draft_aborts_before_typing_or_enter(self):
         """编辑器内已有用户草稿时不能追加模板，更不能按 Enter。"""
 
@@ -1085,7 +2202,13 @@ class TaskReliabilityTests(unittest.TestCase):
         browser = FakeBrowser(context)
         item = FakeConversationItem("确认好友")
         item.active = True
-        selection = tasks.ConfirmedConversation("目标一", "确认好友", item)
+        selection = tasks.ConfirmedConversation(
+            "目标一",
+            "确认好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
 
         with patch.object(
             tasks,
@@ -1135,7 +2258,13 @@ class TaskReliabilityTests(unittest.TestCase):
         browser = FakeBrowser(context)
         item = FakeConversationItem("确认好友")
         item.active = True
-        selection = tasks.ConfirmedConversation("目标一", "确认好友", item)
+        selection = tasks.ConfirmedConversation(
+            "目标一",
+            "确认好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
 
         with patch.object(
             tasks,
@@ -1163,7 +2292,13 @@ class TaskReliabilityTests(unittest.TestCase):
         browser = FakeBrowser(context)
         item = FakeConversationItem("确认好友")
         item.active = True
-        selection = tasks.ConfirmedConversation("目标一", "确认好友", item)
+        selection = tasks.ConfirmedConversation(
+            "目标一",
+            "确认好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
 
         with patch.object(
             tasks,

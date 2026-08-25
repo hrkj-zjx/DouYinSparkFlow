@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -74,6 +75,26 @@ BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
 USER_INFO_URL_FRAGMENT = "aweme/v1/web/im/user/info"
 DOM_CONFIRM_POLL_INTERVAL_MS = 100
 MAX_INVENTORY_SCAN_ROUNDS = 500
+# 单次“从顶到底”扫描必须在底部连续取得三份完全相同的快照。两份快照只能证明
+# 一个等待间隔内没有变化，线上懒加载曾在更晚的等待周期才继续扩展列表，因此这里
+# 明确保留第三个观察点，避免暂时静止被误判为完整。
+REQUIRED_STABLE_BOTTOM_SNAPSHOTS = 3
+# 完整库存还要跨独立扫描复核。最多四次既允许首次扫描只拿到一部分懒加载数据，
+# 又为持续抖动设置明确上限；若四次内始终没有相邻两份相同库存，就拒绝任何点击。
+MAX_INVENTORY_SCAN_PASSES = 4
+# 每次只前进三成视口，让相邻视口至少保留七成重叠。线上虚拟列表会在滚动时复用
+# DOM；较大的重叠既提供“相邻窗口至少共享一个 data-index”的可验证证据，也仍由
+# _scroll_list_forward 强制证明 scrollTop 实际前进，避免原地重复读取制造假稳定。
+INVENTORY_SCROLL_STEP_RATIO = 0.3
+# 到底后的轻微上下触碰用于重新触发依赖滚动事件的懒加载器。幅度刻意很小，不会
+# 跳过任何项目；真正的完整性证据仍来自三份底部快照与跨 pass 的整表一致性。
+INVENTORY_BOTTOM_NUDGE_RATIO = 0.1
+# Enter 守卫只通过固定状态码与 Python 通信。状态中不包含会话 ID、标题或页面异常，
+# 既便于在不可重试的按键边界做严格分支，也避免把权威证明泄漏到日志。
+ENTER_AUTHORITY_GUARD_ARMED = "ENTER_AUTHORITY_GUARD_ARMED"
+ENTER_AUTHORITY_GUARD_ALLOWED = "ENTER_AUTHORITY_GUARD_ALLOWED"
+ENTER_AUTHORITY_GUARD_BLOCKED = "ENTER_AUTHORITY_GUARD_BLOCKED"
+ENTER_AUTHORITY_GUARD_DISARMED = "ENTER_AUTHORITY_GUARD_DISARMED"
 
 
 @dataclass(frozen=True)
@@ -130,6 +151,35 @@ class _SelectionPlanEntry:
 
 
 @dataclass(frozen=True)
+class ConversationAuthoritySnapshot:
+    """IM SDK 与全局会话 store 在同一时刻给出的权威顺序快照。
+
+    ``ordered_ids`` 是服务端会话身份，可能属于账号隐私，因此禁止进入 dataclass
+    ``repr``。业务日志和异常只允许描述证据类型，不得包含列表内容。冻结对象保证
+    一个已批准快照不会被 response 回调或测试替身就地修改；顺序参与相等比较，
+    因而同一批 ID 的任何重排也会使旧发送计划立即失效。
+    """
+
+    has_more: bool
+    sdk_is_loading: bool
+    store_is_loading: bool
+    ordered_ids: Tuple[str, ...] = field(repr=False)
+    # participant sec_uid 与 ordered_ids 同位置绑定，是身份授权链的服务端端点；
+    # 同属账号隐私，禁止出现在 repr 或异常文本中。
+    participant_sec_user_ids: Tuple[str, ...] = field(repr=False)
+
+    @property
+    def is_terminal(self) -> bool:
+        """只有分页结束且 SDK/store 均静止时才是可用于发送的终态。"""
+
+        return (
+            not self.has_more
+            and not self.sdk_is_loading
+            and not self.store_is_loading
+        )
+
+
+@dataclass(frozen=True)
 class ConfirmedConversation:
     """已通过双重 DOM 证据确认的会话选择结果。
 
@@ -143,10 +193,22 @@ class ConfirmedConversation:
     display_name: str
     item: Any = field(compare=False, repr=False)
     covered_targets: Tuple[str, ...] = ()
+    # 旧版 do_user_task 单测会直接构造 selection，故两个新字段允许同时为 None。
+    # 真实 scroll_and_select_user 产出的对象始终同时携带它们，并在点击后、输入前、
+    # 消息构建后及 Enter 前持续复核。
+    stable_index: Optional[int] = None
+    authority_proof: Optional[ConversationAuthoritySnapshot] = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """让旧的单目标构造方式自动得到一致的别名覆盖集合。"""
 
+        if (self.stable_index is None) != (self.authority_proof is None):
+            raise ValueError("稳定索引与权威快照必须同时提供或同时省略")
+        if self.stable_index is not None and self.stable_index < 0:
+            raise ValueError("稳定索引必须是非负整数")
         if not self.covered_targets:
             object.__setattr__(self, "covered_targets", (self.target_symbol,))
             return
@@ -435,11 +497,524 @@ def configure_browser_context(
         context.route("**/*", _handle_lightweight_route)
 
 
+def _preinstall_enter_capture_gate(context: Any) -> None:
+    """在任何页面与站点脚本创建前预装最早的 Enter capture 门禁。
+
+    后装 listener 即使使用 window capture，也会排在站点更早注册的同级监听器之后。
+    ``BrowserContext.add_init_script`` 会在每个 document 的页面脚本之前执行，因此
+    无修饰 Enter 一旦来自真实聊天编辑器，未 arm 或同步验证失败都会先被阻断。
+    Shift+Enter 等带修饰组合不属于发送动作，必须继续放行给多行输入逻辑。门禁
+    listener 随页面上下文销毁；每次发送只清理 arm/validator，不移除最早监听器。
+    """
+
+    editor_selector = json.dumps(CHAT_EDITOR_SELECTOR, ensure_ascii=False)
+    init_script = f"""(() => {{
+        /* preinstallEnterCaptureGate */
+        const guardKey = "__DOUYIN_SPARK_FLOW_ENTER_GUARD_V1__";
+        const editorSelector = {editor_selector};
+        const disarmed = "ENTER_AUTHORITY_GUARD_DISARMED";
+        const armed = "ENTER_AUTHORITY_GUARD_ARMED";
+        const allowed = "ENTER_AUTHORITY_GUARD_ALLOWED";
+        const blocked = "ENTER_AUTHORITY_GUARD_BLOCKED";
+        if (Object.prototype.hasOwnProperty.call(window, guardKey)) return;
+
+        let state = disarmed;
+        let validator = null;
+        let suppressRemainingEnterPhases = false;
+        const rejectEvent = (event) => {{
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }};
+        const findTargetEditor = (event) => {{
+            const target = event.target;
+            if (!(target instanceof Element)) return null;
+            if (target.matches(editorSelector)) return target;
+            return target.closest(editorSelector);
+        }};
+        const isUnmodifiedEnterKeyEvent = (event) => (
+            event.key === "Enter"
+            && !event.shiftKey
+            && !event.ctrlKey
+            && !event.altKey
+            && !event.metaKey
+        );
+        const onKeyDown = (event) => {{
+            // 只接管真实“发送 Enter”。Shift+Enter 必须留给 Slate 插入换行，
+            // 其他页面区域的 Enter 也不属于本任务的副作用边界。
+            if (!isUnmodifiedEnterKeyEvent(event)) return;
+            const targetEditor = findTargetEditor(event);
+            if (targetEditor === null) return;
+            // Chromium 即使 keydown 被 preventDefault，Playwright press 仍会继续
+            // 派发 keyup。先记录本次发送序列，后续相位一律在 window capture 阻断，
+            // 防止站点改用 keypress/keyup 重复或绕过 keydown 门禁提交。
+            suppressRemainingEnterPhases = true;
+
+            if (state !== armed || typeof validator !== "function") {{
+                state = blocked;
+                validator = null;
+                rejectEvent(event);
+                return;
+            }}
+            let proofStillValid = false;
+            try {{
+                // validator 是后续 arm 时捕获的纯同步函数。此处不得返回 Promise，
+                // 从权威 proof 读取到事件继续传播之间不会产生微任务窗口。
+                proofStillValid = validator(event, targetEditor) === true;
+            }} catch (_ignored) {{
+                proofStillValid = false;
+            }}
+            state = proofStillValid ? allowed : blocked;
+            validator = null;
+            if (!proofStillValid) rejectEvent(event);
+        }};
+        const onEnterKeyPhase = (event) => {{
+            if (!isUnmodifiedEnterKeyEvent(event)) return;
+            if (findTargetEditor(event) === null) return;
+            rejectEvent(event);
+            if (event.type === "keyup") suppressRemainingEnterPhases = false;
+        }};
+        const onBeforeInput = (event) => {{
+            if (
+                !suppressRemainingEnterPhases
+                || (
+                    event.inputType !== "insertParagraph"
+                    && event.inputType !== "insertLineBreak"
+                )
+                || findTargetEditor(event) === null
+            ) return;
+            rejectEvent(event);
+        }};
+        const gate = Object.freeze({{
+            version: 1,
+            arm: (candidateValidator) => {{
+                if (
+                    state !== disarmed
+                    || validator !== null
+                    || typeof candidateValidator !== "function"
+                ) return false;
+                validator = candidateValidator;
+                state = armed;
+                return true;
+            }},
+            consume: () => {{
+                const consumedStatus = state;
+                validator = null;
+                state = disarmed;
+                suppressRemainingEnterPhases = false;
+                return consumedStatus;
+            }},
+        }});
+        Object.defineProperty(window, guardKey, {{
+            value: gate,
+            configurable: false,
+            enumerable: false,
+            writable: false,
+        }});
+        window.addEventListener("keydown", onKeyDown, true);
+        window.addEventListener("keypress", onEnterKeyPhase, true);
+        window.addEventListener("beforeinput", onBeforeInput, true);
+        window.addEventListener("keyup", onEnterKeyPhase, true);
+    }})();"""
+    try:
+        context.add_init_script(script=init_script)
+    except Exception:
+        raise ConversationSelectionError(
+            "预装 Enter capture 门禁失败，已禁止创建账号页面"
+        ) from None
+
+
+def _read_authoritative_conversation_snapshot(
+    page: Any,
+) -> ConversationAuthoritySnapshot:
+    """从页面唯一 IM remote 与全局 store 读取严格、可比较的终态快照。
+
+    remote 名称带构建后缀，不能写死完整键名；但前缀必须严格匹配且候选只能有一个。
+    SDK 插件容器可能是数组、Map 或普通对象，统一枚举其值后仍要求只有一个对象把
+    ``initLinkInstance`` 声明为自身属性。页面脚本只返回最小结构，任何查找异常都
+    转为 ``null``；Python 侧随后用固定文案 fail-closed，绝不把 ID、页面对象或
+    Playwright 原始异常正文带入日志。
+    """
+
+    try:
+        raw_snapshot = page.evaluate(
+            """async () => {
+                /* readAuthoritativeConversationSnapshot */
+                try {
+                    const listPluginValues = (plugins) => {
+                        if (Array.isArray(plugins)) return Array.from(plugins);
+                        if (plugins instanceof Map || plugins instanceof Set) {
+                            return Array.from(plugins.values());
+                        }
+                        if (plugins && typeof plugins === "object") {
+                            return Reflect.ownKeys(plugins).map((key) => plugins[key]);
+                        }
+                        return null;
+                    };
+                    const findUniqueLinkOwner = (sdk) => {
+                        const values = listPluginValues(sdk && sdk.plugins);
+                        if (values === null) return null;
+                        const owners = values.filter((plugin) => (
+                            plugin !== null
+                            && (typeof plugin === "object" || typeof plugin === "function")
+                            && Object.prototype.hasOwnProperty.call(
+                                plugin,
+                                "initLinkInstance",
+                            )
+                        ));
+                        return owners.length === 1 ? owners[0] : null;
+                    };
+                    const remoteNames = Object.getOwnPropertyNames(window).filter(
+                        (name) => name.startsWith("__VMOK_@pc-im/im:"),
+                    );
+                    if (remoteNames.length !== 1) return null;
+                    // 线上 __VMOK__ 属性是 remote 容器，不是模块 exports。get('.')
+                    // 异步返回同步 factory；await 完成后立即执行 factory，并在同一
+                    // JavaScript 任务内读取其余引用和全部权威字段。
+                    const remote = window[remoteNames[0]];
+                    if (!remote || typeof remote.get !== "function") return null;
+                    const factory = await remote.get(".");
+                    if (typeof factory !== "function") return null;
+                    const exportsObject = factory();
+                    const context = exportsObject
+                        && exportsObject.Context
+                        && exportsObject.Context.instance;
+                    const manager = context
+                        && context.imSdkService
+                        && context.imSdkService.imSdkManager;
+                    if (!manager || typeof manager.getImSdkInstance !== "function") {
+                        return null;
+                    }
+                    const sdk = manager.getImSdkInstance();
+                    const linkOwner = findUniqueLinkOwner(sdk);
+                    const link = linkOwner && linkOwner.initLinkInstance;
+                    const store = window.conversationStore;
+                    const nextParams = link && link.nextParams;
+                    if (!link || !nextParams || !store) return null;
+                    const orderedIds = store.sortedConversationIdList;
+                    const conversationMap = store.conversationMap;
+                    const participantSecUserIds = (
+                        Array.isArray(orderedIds)
+                        && conversationMap
+                        && typeof conversationMap.get === "function"
+                    ) ? orderedIds.map((conversationId) => {
+                        const record = conversationMap.get(conversationId);
+                        return record && record.toParticipantSecUserId;
+                    }) : null;
+                    return {
+                        hasMore: nextParams.hasMore,
+                        sdkIsLoading: link.isLoading,
+                        storeIsLoading: store.isLoading,
+                        orderedIds: Array.isArray(orderedIds)
+                            ? Array.from(orderedIds)
+                            : orderedIds,
+                        participantSecUserIds,
+                    };
+                } catch (_ignored) {
+                    return null;
+                }
+            }"""
+        )
+    except Exception:
+        raise ConversationSelectionError(
+            "读取 IM 会话权威状态失败，已禁止继续发送"
+        ) from None
+
+    if not isinstance(raw_snapshot, Mapping):
+        raise ConversationSelectionError(
+            "IM 会话权威状态结构缺失，已禁止继续发送"
+        )
+
+    has_more = raw_snapshot.get("hasMore")
+    sdk_is_loading = raw_snapshot.get("sdkIsLoading")
+    store_is_loading = raw_snapshot.get("storeIsLoading")
+    ordered_ids = raw_snapshot.get("orderedIds")
+    participant_sec_user_ids = raw_snapshot.get("participantSecUserIds")
+    if (
+        type(has_more) is not bool
+        or type(sdk_is_loading) is not bool
+        or type(store_is_loading) is not bool
+        or not isinstance(ordered_ids, list)
+        or not ordered_ids
+        or any(
+            not isinstance(conversation_id, str) or not conversation_id.strip()
+            for conversation_id in ordered_ids
+        )
+        or len(set(ordered_ids)) != len(ordered_ids)
+        or not isinstance(participant_sec_user_ids, list)
+        or len(participant_sec_user_ids) != len(ordered_ids)
+        or any(
+            not isinstance(participant_id, str) or not participant_id.strip()
+            for participant_id in participant_sec_user_ids
+        )
+    ):
+        raise ConversationSelectionError(
+            "IM 会话权威状态字段无效，已禁止继续发送"
+        )
+
+    return ConversationAuthoritySnapshot(
+        has_more=has_more,
+        sdk_is_loading=sdk_is_loading,
+        store_is_loading=store_is_loading,
+        ordered_ids=tuple(ordered_ids),
+        participant_sec_user_ids=tuple(participant_sec_user_ids),
+    )
+
+
+def _conversation_item_is_actionable_in_list(item: Any) -> bool:
+    """只读判断会话项是否真正位于唯一列表容器的可交互区域内。
+
+    抖音虚拟列表会把视口上下方的 overscan 项继续留在 DOM 中；Locator 能找到这类
+    项，但它们尚未与滚动容器相交，不能据此提前选定点击候选。这里复用原子点击
+    边界的连接状态、样式和矩形相交约束，只返回布尔值且不产生点击、滚动或输入。
+    页面结构缺失或 evaluate 异常统一视为不可操作，让搜索继续向下滚动；若到达
+    底部仍没有真实可见目标，外层会按既有协议 fail-closed。
+    """
+
+    try:
+        return item.evaluate(
+            """(element) => {
+                /* conversationItemIsActionableInList */
+                try {
+                    if (!element || !element.isConnected) return false;
+                    const listContainers = document.querySelectorAll(
+                        ".conversationConversationListwrapper",
+                    );
+                    if (listContainers.length !== 1) return false;
+                    const listContainer = listContainers[0];
+                    if (
+                        !listContainer.isConnected
+                        || !listContainer.contains(element)
+                    ) return false;
+
+                    const style = getComputedStyle(element);
+                    if (
+                        style.display === "none"
+                        || style.visibility !== "visible"
+                        || style.pointerEvents === "none"
+                    ) return false;
+                    const elementRect = element.getBoundingClientRect();
+                    const listRect = listContainer.getBoundingClientRect();
+                    return (
+                        elementRect.width > 0
+                        && elementRect.height > 0
+                        && Math.min(elementRect.right, listRect.right)
+                            > Math.max(elementRect.left, listRect.left)
+                        && Math.min(elementRect.bottom, listRect.bottom)
+                            > Math.max(elementRect.top, listRect.top)
+                    );
+                } catch (_ignored) {
+                    return false;
+                }
+            }"""
+        ) is True
+    except Exception:
+        # 这是点击前的只读可操作性探针。Playwright/DOM 异常不能降级为“可点击”，
+        # 也不能把可能包含页面信息的原始异常带入账号日志。
+        return False
+
+
+def _click_conversation_at_authority_boundary(
+    item: Any,
+    stable_index: int,
+    expected_display_name: str,
+    authority_proof: ConversationAuthoritySnapshot,
+) -> None:
+    """在同一个浏览器任务内复核权威顺序、索引和连接状态后执行一次点击。
+
+    若先在 Python 读取 authority、再调用 Playwright ``click``，两次协议往返之间页面
+    仍可处理新的 IM 事件。这里改为 Locator.evaluate：浏览器在一个 JavaScript 任务
+    内完成全部比较并调用 DOM ``element.click()``，从而把最后证据检查与首个副作用
+    收敛到同一事件循环边界。异步 remote factory 在所有证明读取之前完成；从读取
+    proof 到 ``element.click()`` 之间没有任何 await。返回值只有固定错误码，ID 既
+    不写日志也不进入异常文本。
+    """
+
+    expected = {
+        "stableIndex": stable_index,
+        "displayName": expected_display_name,
+        "hasMore": authority_proof.has_more,
+        "sdkIsLoading": authority_proof.sdk_is_loading,
+        "storeIsLoading": authority_proof.store_is_loading,
+        "orderedIds": list(authority_proof.ordered_ids),
+        "participantSecUserIds": list(authority_proof.participant_sec_user_ids),
+    }
+    try:
+        clicked = item.evaluate(
+            r"""async (element, expected) => {
+                /* clickAtAuthoritativeConversationBoundary */
+                const rejected = "AUTHORITY_BOUNDARY_REJECTED";
+                try {
+                    const listPluginValues = (plugins) => {
+                        if (Array.isArray(plugins)) return Array.from(plugins);
+                        if (plugins instanceof Map || plugins instanceof Set) {
+                            return Array.from(plugins.values());
+                        }
+                        if (plugins && typeof plugins === "object") {
+                            return Reflect.ownKeys(plugins).map((key) => plugins[key]);
+                        }
+                        return null;
+                    };
+                    const findUniqueLinkOwner = (sdk) => {
+                        const values = listPluginValues(sdk && sdk.plugins);
+                        if (values === null) return null;
+                        const owners = values.filter((plugin) => (
+                            plugin !== null
+                            && (typeof plugin === "object" || typeof plugin === "function")
+                            && Object.prototype.hasOwnProperty.call(
+                                plugin,
+                                "initLinkInstance",
+                            )
+                        ));
+                        return owners.length === 1 ? owners[0] : null;
+                    };
+                    const normalizeTitle = (value) => String(value)
+                        .normalize("NFKC")
+                        .replace(/[\u200b\ufeff]/gu, "")
+                        .replace(/\s+/gu, " ")
+                        .trim();
+
+                    const remoteNames = Object.getOwnPropertyNames(window).filter(
+                        (name) => name.startsWith("__VMOK_@pc-im/im:"),
+                    );
+                    if (remoteNames.length !== 1) return rejected;
+                    const remote = window[remoteNames[0]];
+                    if (!remote || typeof remote.get !== "function") return rejected;
+                    // 唯一 await 位于所有副作用边界证明之前。factory 返回后直到
+                    // element.click() 不再让出事件循环。
+                    const factory = await remote.get(".");
+                    if (typeof factory !== "function") return rejected;
+                    const exportsObject = factory();
+
+                    if (
+                        !element
+                        || !element.isConnected
+                        || element.ownerDocument !== document
+                        || !(element instanceof HTMLElement)
+                        || !element.matches(
+                            ".conversationConversationItemwrapper",
+                        )
+                        || !Number.isSafeInteger(expected.stableIndex)
+                        || expected.stableIndex < 0
+                        || !Array.isArray(expected.orderedIds)
+                        || !Array.isArray(expected.participantSecUserIds)
+                        || expected.participantSecUserIds.length
+                            !== expected.orderedIds.length
+                        || expected.stableIndex >= expected.orderedIds.length
+                    ) return rejected;
+                    const indexedAncestor = element.closest("[data-index]");
+                    const rawIndex = indexedAncestor
+                        && indexedAncestor.getAttribute("data-index");
+                    if (
+                        !indexedAncestor
+                        || !/^(0|[1-9]\d*)$/.test(rawIndex || "")
+                        || rawIndex !== String(expected.stableIndex)
+                    ) return rejected;
+
+                    const titles = element.querySelectorAll(
+                        ".conversationConversationItemtitle",
+                    );
+                    if (
+                        titles.length !== 1
+                        || normalizeTitle(titles[0].textContent || "")
+                            !== expected.displayName
+                    ) return rejected;
+
+                    const listContainers = document.querySelectorAll(
+                        ".conversationConversationListwrapper",
+                    );
+                    if (listContainers.length !== 1) return rejected;
+                    const listContainer = listContainers[0];
+                    if (
+                        !listContainer.isConnected
+                        || !listContainer.contains(element)
+                    ) return rejected;
+                    const style = getComputedStyle(element);
+                    if (
+                        style.display === "none"
+                        || style.visibility !== "visible"
+                        || style.pointerEvents === "none"
+                    ) return rejected;
+                    const elementRect = element.getBoundingClientRect();
+                    const listRect = listContainer.getBoundingClientRect();
+                    const intersects = (
+                        elementRect.width > 0
+                        && elementRect.height > 0
+                        && Math.min(elementRect.right, listRect.right)
+                            > Math.max(elementRect.left, listRect.left)
+                        && Math.min(elementRect.bottom, listRect.bottom)
+                            > Math.max(elementRect.top, listRect.top)
+                    );
+                    if (!intersects) return rejected;
+
+                    const context = exportsObject
+                        && exportsObject.Context
+                        && exportsObject.Context.instance;
+                    const manager = context
+                        && context.imSdkService
+                        && context.imSdkService.imSdkManager;
+                    if (!manager || typeof manager.getImSdkInstance !== "function") {
+                        return rejected;
+                    }
+                    const sdk = manager.getImSdkInstance();
+                    const linkOwner = findUniqueLinkOwner(sdk);
+                    const link = linkOwner && linkOwner.initLinkInstance;
+                    const nextParams = link && link.nextParams;
+                    const store = window.conversationStore;
+                    const orderedIds = store && store.sortedConversationIdList;
+                    const conversationMap = store && store.conversationMap;
+                    if (
+                        !nextParams
+                        || !Array.isArray(orderedIds)
+                        || !conversationMap
+                        || typeof conversationMap.get !== "function"
+                        || nextParams.hasMore !== expected.hasMore
+                        || link.isLoading !== expected.sdkIsLoading
+                        || store.isLoading !== expected.storeIsLoading
+                        || orderedIds.length !== expected.orderedIds.length
+                        || orderedIds.some(
+                            (value, index) => value !== expected.orderedIds[index],
+                        )
+                        || orderedIds.some((conversationId, index) => {
+                            const record = conversationMap.get(conversationId);
+                            return (
+                                !record
+                                || record.toParticipantSecUserId
+                                    !== expected.participantSecUserIds[index]
+                            );
+                        })
+                        || orderedIds[expected.stableIndex]
+                            !== expected.orderedIds[expected.stableIndex]
+                    ) return rejected;
+
+                    // 固定调用原生 HTMLElement click，避免页面在元素实例上覆盖同名
+                    // 属性改变副作用；站点若拒绝非 trusted 事件，后续双 DOM 证据会
+                    // fail-closed，绝不会直接进入编辑器输入。
+                    HTMLElement.prototype.click.call(element);
+                    return "AUTHORITY_BOUNDARY_CLICKED";
+                } catch (_ignored) {
+                    return "AUTHORITY_BOUNDARY_ERROR";
+                }
+            }""",
+            expected,
+        )
+    except Exception:
+        raise ConversationSelectionError(
+            "权威会话点击边界执行失败，已在输入前终止"
+        ) from None
+    if clicked != "AUTHORITY_BOUNDARY_CLICKED":
+        raise ConversationSelectionError(
+            "点击边界的会话权威状态或稳定索引已变化，已取消点击"
+        )
+
+
 def _conversation_selection_matches(
     page: Any,
     item: Any,
     expected_display_name: str,
     probe_timeout_ms: int = DOM_CONFIRM_POLL_INTERVAL_MS,
+    *,
+    expected_stable_index: Optional[int] = None,
+    expected_authority: Optional[ConversationAuthoritySnapshot] = None,
 ) -> bool:
     """一次性验证“原列表项选中 + 右侧标题一致”两项会话证据。
 
@@ -447,6 +1022,25 @@ def _conversation_selection_matches(
     全角字符、不可见空格或连续空白让两个视觉上近似的名字被错误地视为同一人。
     右侧标题也必须唯一；零个或多个标题节点都属于页面状态不确定。
     """
+
+    if (expected_stable_index is None) != (expected_authority is None):
+        return False
+    if expected_authority is not None:
+        try:
+            if (
+                _read_authoritative_conversation_snapshot(page)
+                != expected_authority
+                or _read_stable_conversation_index(
+                    item,
+                    timeout_ms=probe_timeout_ms,
+                )
+                != expected_stable_index
+            ):
+                return False
+        except Exception:
+            # 这是只读布尔探针，调用方会转换为固定的阶段错误。不得把权威对象、
+            # 会话 ID 或 Playwright 异常泄漏到选择确认日志。
+            return False
 
     bounded_probe_timeout = max(1, int(probe_timeout_ms))
     item_classes = set(
@@ -464,12 +1058,31 @@ def _conversation_selection_matches(
     right_title = page.locator(RIGHT_PANEL_TITLE_SELECTOR)
     if right_title.count() != 1:
         return False
-    return (
+    title_matches = (
         _normalize_identity_value(
             right_title.inner_text(timeout=bounded_probe_timeout)
         )
         == expected_display_name
     )
+    if not title_matches:
+        return False
+    if expected_authority is not None:
+        try:
+            # class、右标题等 Locator 读取本身会泵送页面事件。全部 DOM 证据成立后
+            # 再读一次 authority 和索引，防止顺序恰在第一次 proof 与标题之间变化，
+            # 却被输入前或 Enter 前的布尔探针错误放行。
+            return (
+                _read_authoritative_conversation_snapshot(page)
+                == expected_authority
+                and _read_stable_conversation_index(
+                    item,
+                    timeout_ms=probe_timeout_ms,
+                )
+                == expected_stable_index
+            )
+        except Exception:
+            return False
+    return True
 
 
 def _wait_for_confirmed_conversation(
@@ -477,6 +1090,9 @@ def _wait_for_confirmed_conversation(
     item: Any,
     expected_display_name: str,
     timeout_ms: int,
+    *,
+    expected_stable_index: Optional[int] = None,
+    expected_authority: Optional[ConversationAuthoritySnapshot] = None,
 ) -> None:
     """有限等待被点击会话取得双重证据，超时后以异常终止账号。
 
@@ -502,6 +1118,8 @@ def _wait_for_confirmed_conversation(
                 item,
                 expected_display_name,
                 probe_timeout_ms=probe_timeout,
+                expected_stable_index=expected_stable_index,
+                expected_authority=expected_authority,
             ):
                 return
         except Exception:
@@ -624,9 +1242,15 @@ def _is_list_bottom(metrics: Tuple[float, float, float]) -> bool:
 
 
 def _scroll_list_forward(page: Any, list_handle: Any, client_height: float) -> None:
-    """向前滚动一个视口，并要求滚动位置确实推进。"""
+    """重叠地向前滚动约三成视口，并要求滚动位置确实推进。
+
+    七成重叠让调用方能够验证相邻窗口确实共享 ``data-index``，避免虚拟列表恰好
+    在边界替换 DOM 时漏项。步长仍以当前 ``clientHeight`` 动态计算，兼容服务器
+    端不同窗口尺寸。
+    """
 
     before, _, _ = _read_list_metrics(page, list_handle)
+    step = max(client_height * INVENTORY_SCROLL_STEP_RATIO, 1)
     new_position = page.evaluate(
         """([element, step]) => {
             element.scrollTop = Math.min(
@@ -635,7 +1259,7 @@ def _scroll_list_forward(page: Any, list_handle: Any, client_height: float) -> N
             );
             return element.scrollTop;
         }""",
-        [list_handle, max(client_height, 1)],
+        [list_handle, step],
     )
     try:
         after = float(new_position)
@@ -644,6 +1268,57 @@ def _scroll_list_forward(page: Any, list_handle: Any, client_height: float) -> N
     if after <= before:
         raise ConversationSelectionError(
             "好友列表尚未到底但滚动位置没有推进，预扫描无法证明完整"
+        )
+
+
+def _nudge_list_at_bottom(
+    page: Any,
+    list_handle: Any,
+    client_height: float,
+) -> None:
+    """在底部做一次无点击、无输入的轻微滚动触碰。
+
+    某些无限列表只在收到新的 scroll 事件后才检查是否继续拉取。脚本先向上移动
+    一小段，在下一动画帧回到当时的真实底部；若等待期间列表扩展，外层下一轮会
+    重新读取指标并继续向下扫描，而不会把旧 ``scrollHeight`` 当成完成证据。
+    单页不可滚动列表无需触碰。
+    """
+
+    scroll_top, _, scroll_height = _read_list_metrics(page, list_handle)
+    maximum_scroll_top = max(scroll_height - client_height, 0)
+    if maximum_scroll_top <= 1:
+        return
+
+    raw_position = page.evaluate(
+        """async ([element, distance]) => {
+            const maximum = Math.max(
+                element.scrollHeight - element.clientHeight,
+                0,
+            );
+            element.scrollTop = Math.max(maximum - Math.min(distance, maximum), 0);
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+            element.scrollTop = Math.max(
+                element.scrollHeight - element.clientHeight,
+                0,
+            );
+            return element.scrollTop;
+        }""",
+        [
+            list_handle,
+            max(client_height * INVENTORY_BOTTOM_NUDGE_RATIO, 1),
+        ],
+    )
+    try:
+        returned_position = float(raw_position)
+    except (TypeError, ValueError) as exc:
+        raise ConversationSelectionError(
+            "好友列表底部触碰结果异常，无法继续验证懒加载稳定性"
+        ) from exc
+    if returned_position < 0 or returned_position + 1 < scroll_top:
+        # 回到底部后的值不应明显小于触碰前位置；若页面脚本重写了滚动行为，继续
+        # 扫描将失去“从顶到底”的可靠顺序，因此在任何点击前直接终止。
+        raise ConversationSelectionError(
+            "好友列表底部触碰后位置异常，无法证明预扫描完整"
         )
 
 
@@ -700,37 +1375,140 @@ def _record_visible_inventory(
     return added_count
 
 
-def _scan_full_conversation_inventory(
+def _scan_conversation_inventory_pass(
     page: Any,
+    list_handle: Any,
     friend_list_wait_time: int,
-) -> Tuple[Dict[int, str], Any]:
-    """在任何点击前完整只读扫描列表、证明到底，并验证成功回顶。
+) -> Tuple[Dict[int, str], ConversationAuthoritySnapshot]:
+    """执行一次绑定权威顺序的“回顶 -> 重叠滚动 -> 三快照到底”扫描。
 
-    到达底部后必须再等待并得到一轮“索引映射与 scrollHeight 均不变化”的相同
-    快照，避免把正在异步追加数据的暂时底部误认为完整列表。扫描轮数有硬上限；
-    超限、无法滚动、索引不稳定或回顶失败一律 fail-closed。
+    DOM ``data-index`` 只有在同一份 SDK/store 权威快照下才有可比较含义。每轮读取
+    可见窗口前后都核对 authority；一旦变化，立即丢弃整个累计库存并验证回顶，
+    绝不把旧顺序的索引与新顺序混在一张表里。相邻窗口还必须共享至少一个索引，
+    将“70% 重叠”从滚动参数提升为可验收证据。
+
+    到底后只有 authority 已终态、DOM 键精确覆盖 ``0..N-1``、物理位置确实在底部
+    且三份连续签名完全一致才返回。``hasMore`` 或任一 loading 为真时，即使 DOM
+    长时间保持 45 项也不会被当成完整列表。
     """
 
-    list_handle = _get_conversation_list_handle(page)
-    # 首次通常已在顶部，但上一条消息可能让虚拟列表重排并保留中间滚动位置。
-    # 每轮库存都从经过验证的顶部开始，data-index 只在本轮只读扫描内作为位置键。
     _reset_list_to_top(page, list_handle, friend_list_wait_time)
+    authority = _read_authoritative_conversation_snapshot(page)
     inventory: Dict[int, str] = {}
-    previous_bottom_signature: Optional[Tuple[Tuple[Tuple[int, str], ...], float]] = None
+    previous_visible_indices: Optional[Set[int]] = None
+    previous_bottom_signature: Optional[
+        Tuple[
+            Tuple[Tuple[int, str], ...],
+            float,
+            ConversationAuthoritySnapshot,
+        ]
+    ] = None
+    stable_bottom_snapshots = 0
 
     for _ in range(MAX_INVENTORY_SCAN_ROUNDS):
-        _record_visible_inventory(page, inventory)
+        authority_before = _read_authoritative_conversation_snapshot(page)
+        if authority_before != authority:
+            # 顺序、分页或 loading 任一字段变化都会使已读 data-index 失去原语义。
+            # 先清空再回顶，下一轮只在新 authority 下重新建立库存。
+            authority = authority_before
+            inventory.clear()
+            previous_visible_indices = None
+            previous_bottom_signature = None
+            stable_bottom_snapshots = 0
+            _reset_list_to_top(page, list_handle, friend_list_wait_time)
+            continue
+
+        if authority.sdk_is_loading or authority.store_is_loading:
+            # loading 期间 DOM 可能处于中间提交状态，不能读取或滚动后保留任何项。
+            # 等待页面事件推进；若状态改变，下一轮会走上面的回顶重扫分支。
+            inventory.clear()
+            previous_visible_indices = None
+            previous_bottom_signature = None
+            stable_bottom_snapshots = 0
+            _wait_for_page(page, friend_list_wait_time)
+            continue
+
+        # 先把当前窗口读入临时映射；只有窗口读取后的 authority 仍完全相同，才会
+        # 合并到本 pass 库存。这样 authority 在逐项读取期间变化也不会污染旧累计。
+        visible_inventory: Dict[int, str] = {}
+        _record_visible_inventory(page, visible_inventory)
+        authority_after = _read_authoritative_conversation_snapshot(page)
+        if authority_after != authority:
+            authority = authority_after
+            inventory.clear()
+            previous_visible_indices = None
+            previous_bottom_signature = None
+            stable_bottom_snapshots = 0
+            _reset_list_to_top(page, list_handle, friend_list_wait_time)
+            continue
+
+        visible_indices = set(visible_inventory)
+        if not visible_indices:
+            raise ConversationSelectionError(
+                "可见会话窗口为空，无法证明权威库存与 DOM 一一覆盖"
+            )
+        if (
+            previous_visible_indices is not None
+            and not visible_indices.intersection(previous_visible_indices)
+        ):
+            raise ConversationSelectionError(
+                "相邻会话窗口没有重叠索引，无法证明滚动扫描连续"
+            )
+        for stable_index, display_name in visible_inventory.items():
+            previous_name = inventory.get(stable_index)
+            if previous_name is not None and previous_name != display_name:
+                raise ConversationSelectionError(
+                    "同一权威顺序下 data-index 映射标题发生变化，已取消扫描"
+                )
+            inventory[stable_index] = display_name
+        previous_visible_indices = visible_indices
+
+        expected_indices = set(range(len(authority.ordered_ids)))
+        if not set(inventory).issubset(expected_indices):
+            raise ConversationSelectionError(
+                "DOM 会话索引超出权威顺序范围，已禁止进入发送阶段"
+            )
+
         metrics = _read_list_metrics(page, list_handle)
         if _is_list_bottom(metrics):
-            signature = (tuple(sorted(inventory.items())), metrics[2])
-            if signature == previous_bottom_signature:
-                _reset_list_to_top(page, list_handle, friend_list_wait_time)
-                return inventory, list_handle
-            previous_bottom_signature = signature
+            inventory_complete = set(inventory) == expected_indices
+            if authority.is_terminal and inventory_complete:
+                signature = (
+                    tuple(sorted(inventory.items())),
+                    metrics[2],
+                    authority,
+                )
+                if signature == previous_bottom_signature:
+                    stable_bottom_snapshots += 1
+                else:
+                    previous_bottom_signature = signature
+                    stable_bottom_snapshots = 1
+                if stable_bottom_snapshots >= REQUIRED_STABLE_BOTTOM_SNAPSHOTS:
+                    final_authority = _read_authoritative_conversation_snapshot(page)
+                    if final_authority == authority:
+                        return inventory, authority
+                    # 第三份 DOM 快照之后 authority 才变化时也不能返回混合证据；
+                    # 丢弃后回顶，让新顺序重新经历完整三快照协议。
+                    authority = final_authority
+                    inventory.clear()
+                    previous_visible_indices = None
+                    previous_bottom_signature = None
+                    stable_bottom_snapshots = 0
+                    _reset_list_to_top(page, list_handle, friend_list_wait_time)
+                    continue
+            else:
+                previous_bottom_signature = None
+                stable_bottom_snapshots = 0
+
+            # 触碰本身没有业务副作用，只帮助触发依赖滚动事件的懒加载判断。随后
+            # 完整等待一次；下一轮会重新读取可见项和滚动指标，列表若扩展就会把
+            # 稳定计数清零并恢复向下滚动。
+            _nudge_list_at_bottom(page, list_handle, metrics[1])
             _wait_for_page(page, friend_list_wait_time)
             continue
 
         previous_bottom_signature = None
+        stable_bottom_snapshots = 0
         _scroll_list_forward(page, list_handle, metrics[1])
         _wait_for_page(page, friend_list_wait_time)
 
@@ -739,10 +1517,55 @@ def _scan_full_conversation_inventory(
     )
 
 
+def _scan_full_conversation_inventory(
+    page: Any,
+    friend_list_wait_time: int,
+) -> Tuple[Dict[int, str], Any, ConversationAuthoritySnapshot]:
+    """在任何点击前取得经两次独立全扫描确认的稳定库存。
+
+    单个 pass 即使在底部连续稳定三轮，也可能只看见服务端暂时返回的前一批会话。
+    因此本函数强制重新回顶并再走完整列表，只有相邻两个 pass 的 ``data-index ->
+    标题`` 映射逐项相等才允许回顶并交给发送计划。首次不一致可继续，最多四个
+    pass；持续变化说明完整性无法证明，必须 fail-closed。
+    """
+
+    list_handle = _get_conversation_list_handle(page)
+    previous_inventory: Optional[Dict[int, str]] = None
+    previous_authority: Optional[ConversationAuthoritySnapshot] = None
+
+    for _ in range(MAX_INVENTORY_SCAN_PASSES):
+        current_inventory, current_authority = _scan_conversation_inventory_pass(
+            page,
+            list_handle,
+            friend_list_wait_time,
+        )
+        if (
+            previous_inventory is not None
+            and current_inventory == previous_inventory
+            and current_authority == previous_authority
+        ):
+            # 返回前再次验证顶部，既满足首个点击从已知起点开始，也防止第二个 pass
+            # 到底后页面自行反弹却被调用方误认为仍可按库存索引查找。
+            _reset_list_to_top(page, list_handle, friend_list_wait_time)
+            final_authority = _read_authoritative_conversation_snapshot(page)
+            if final_authority != current_authority:
+                raise ConversationSelectionError(
+                    "完整扫描后回顶时权威会话顺序已变化，已取消发送计划"
+                )
+            return current_inventory, list_handle, current_authority
+        previous_inventory = dict(current_inventory)
+        previous_authority = current_authority
+
+    raise ConversationSelectionError(
+        "好友列表连续完整扫描始终不一致，无法证明库存稳定，已禁止进入发送阶段"
+    )
+
+
 def _build_unique_selection_plan(
     inventory: Mapping[int, str],
     targets: Sequence[str],
     identity_index: Optional[IdentityIndex],
+    authority: Optional[ConversationAuthoritySnapshot] = None,
 ) -> Dict[int, _SelectionPlanEntry]:
     """在第一次点击前证明每个配置标识恰好对应一个全局稳定会话。
 
@@ -755,6 +1578,78 @@ def _build_unique_selection_plan(
     normalized_targets = tuple(_normalize_identity_value(target) for target in targets)
     if not normalized_targets or len(set(normalized_targets)) != len(normalized_targets):
         raise ConversationSelectionError("配置目标为空或规范化后重复，无法建立唯一发送计划")
+
+    if authority is not None and identity_index is not None:
+        # 正式路径不再从 DOM 标题反推身份。user/info 的冻结 FriendIdentity.sec_uid
+        # 必须与 authority 同索引 participant 一一 join；昵称/备注只可作为同一身份
+        # 的冗余别名，每个逻辑会话至少包含一个短号、抖音号或 sec_uid 强锚点。
+        identities = {
+            identity
+            for identity_set in identity_index.values()
+            for identity in identity_set
+        }
+        matches_by_target: Dict[str, List[int]] = {
+            target: [] for target in normalized_targets
+        }
+        candidate_plan: Dict[int, _SelectionPlanEntry] = {}
+        normalized_participants = tuple(
+            _normalize_identity_value(participant_id)
+            for participant_id in authority.participant_sec_user_ids
+        )
+        for identity in identities:
+            if not identity.sec_uid:
+                continue
+            participant_indices = [
+                index
+                for index, participant_id in enumerate(normalized_participants)
+                if participant_id == identity.sec_uid
+            ]
+            if len(participant_indices) != 1:
+                continue
+            all_candidates = set(identity.candidates())
+            strong_candidates = {
+                candidate
+                for candidate in (
+                    identity.short_id,
+                    identity.unique_id,
+                    identity.sec_uid,
+                )
+                if candidate
+            }
+            covered_targets = tuple(
+                target for target in normalized_targets if target in all_candidates
+            )
+            if (
+                not covered_targets
+                or not any(target in strong_candidates for target in covered_targets)
+            ):
+                continue
+            stable_index = participant_indices[0]
+            if stable_index not in inventory or stable_index in candidate_plan:
+                raise ConversationSelectionError(
+                    "participant 身份与稳定会话索引不是一一映射，发送计划已取消"
+                )
+            match = _TargetAliasMatch(covered_targets, identity)
+            candidate_plan[stable_index] = _SelectionPlanEntry(
+                display_name=inventory[stable_index],
+                match=match,
+            )
+            for target_symbol in covered_targets:
+                matches_by_target[target_symbol].append(stable_index)
+
+        invalid_target_count = sum(
+            1 for matches in matches_by_target.values() if len(matches) != 1
+        )
+        if invalid_target_count:
+            raise ConversationSelectionError(
+                f"{invalid_target_count} 个配置标识未由唯一 participant 强身份覆盖，"
+                "发送计划已整体取消"
+            )
+        selected_indices = {matches[0] for matches in matches_by_target.values()}
+        return {
+            stable_index: candidate_plan[stable_index]
+            for stable_index in selected_indices
+        }
 
     display_to_indices: Dict[str, Set[int]] = {}
     for stable_index, display_name in inventory.items():
@@ -827,7 +1722,7 @@ def scroll_and_select_user(
     remaining_targets = [_normalize_identity_value(target) for target in targets]
     while remaining_targets:
         logger.debug("开始为剩余 %s 个配置标识只读预扫描全部好友会话", len(remaining_targets))
-        inventory, list_handle = _scan_full_conversation_inventory(
+        inventory, list_handle, authority_proof = _scan_full_conversation_inventory(
             page,
             friend_list_wait_time,
         )
@@ -835,6 +1730,7 @@ def scroll_and_select_user(
             inventory,
             remaining_targets,
             identity_index,
+            authority=authority_proof,
         )
         logger.info(
             "发送计划已通过唯一性校验：配置标识数=%s，唯一会话数=%s，"
@@ -844,8 +1740,13 @@ def scroll_and_select_user(
             len(inventory),
         )
 
-        selected: Optional[Tuple[_SelectionPlanEntry, Any]] = None
+        selected: Optional[Tuple[int, _SelectionPlanEntry, Any]] = None
         for _ in range(MAX_INVENTORY_SCAN_ROUNDS):
+            authority_before = _read_authoritative_conversation_snapshot(page)
+            if authority_before != authority_proof:
+                raise ConversationSelectionError(
+                    "发送阶段读取窗口前权威会话顺序已变化，已取消点击"
+                )
             round_indices: Set[int] = set()
             for element in page.locator(CONVERSATION_ITEM_SELECTOR).all():
                 stable_index, display_name = _read_conversation_item(element)
@@ -858,7 +1759,7 @@ def scroll_and_select_user(
                     raise ConversationSelectionError(
                         "发送阶段会话索引或标题偏离本轮预扫描库存，已在输入前终止"
                     )
-                if stable_index not in plan:
+                if stable_index not in plan or selected is not None:
                     continue
 
                 plan_entry = plan[stable_index]
@@ -866,21 +1767,18 @@ def scroll_and_select_user(
                     raise ConversationSelectionError(
                         "目标会话标题偏离本轮预扫描计划，已在输入前终止"
                     )
-                # response 回调可能在计划构建后继续补充同名身份。点击前必须基于
-                # 当前集合重算一次；若唯一身份变为歧义或改为命中另一目标，旧计划
-                # 立即失效，不能依赖几毫秒前的快照触碰会话。
-                current_match = _match_target_aliases(
-                    display_name,
-                    remaining_targets,
-                    identity_index=identity_index,
-                    allow_direct_display_match=True,
+                if not _conversation_item_is_actionable_in_list(element):
+                    # 虚拟列表的 overscan 会把尚未进入容器可视区域的目标保留在
+                    # DOM。它仍参与完整库存和唯一性校验，但不能在本轮被选为点击
+                    # 候选；继续滚动后，由同一稳定索引的真实相交项再次通过筛选。
+                    continue
+                selected = (stable_index, plan_entry, element)
+
+            authority_after = _read_authoritative_conversation_snapshot(page)
+            if authority_after != authority_proof:
+                raise ConversationSelectionError(
+                    "发送阶段读取窗口后权威会话顺序已变化，已取消点击"
                 )
-                if current_match != plan_entry.match:
-                    raise ConversationSelectionError(
-                        "点击前好友身份或别名覆盖集合已变化，发送计划已取消"
-                    )
-                selected = (plan_entry, element)
-                break
 
             if selected is not None:
                 break
@@ -897,36 +1795,31 @@ def scroll_and_select_user(
                 "发送阶段超过安全扫描轮数，列表状态无法确认"
             )
 
-        plan_entry, element = selected
+        stable_index, plan_entry, element = selected
         display_name = plan_entry.display_name
 
-        # 逐项重验只能证明“当前待点击会话”仍覆盖原别名，却看不到另一个未选中的
-        # 显示名是否刚被新到达的好友身份响应补成了同一别名。此时原会话的匹配值
-        # 可以完全不变，但全局唯一性已经失效。因而在副作用边界前，必须用同一份
-        # 只读 DOM 库存和当前最新身份索引完整重建计划；任何构建异常或计划差异都
-        # 在 element.click() 之前终止，绝不把局部稳定误当成全局稳定。
-        try:
-            refreshed_plan = _build_unique_selection_plan(
-                inventory,
-                remaining_targets,
-                identity_index,
-            )
-        except Exception as exc:
-            raise ConversationSelectionError(
-                "点击前完整发送计划无法重新通过唯一性校验，已取消点击"
-            ) from exc
-        if refreshed_plan != plan:
-            raise ConversationSelectionError(
-                "点击前完整发送计划已变化，已取消点击"
-            )
+        # 身份授权已冻结在 plan_entry.identity 与 authority participant proof 中。
+        # response 回调继续修改 identity_index 不能改变本轮许可；点击边界只重验
+        # 不可变 authority 与 DOM index/title，避免 mutable 索引撤销或替换授权。
 
         try:
-            element.click()
+            if _read_authoritative_conversation_snapshot(page) != authority_proof:
+                raise ConversationSelectionError(
+                    "点击前权威会话顺序已变化，已取消点击"
+                )
+            _click_conversation_at_authority_boundary(
+                element,
+                stable_index,
+                display_name,
+                authority_proof,
+            )
             _wait_for_confirmed_conversation(
                 page,
                 element,
                 display_name,
                 confirmation_timeout,
+                expected_stable_index=stable_index,
+                expected_authority=authority_proof,
             )
         except Exception as exc:
             if isinstance(exc, ConversationSelectionError):
@@ -941,6 +1834,8 @@ def scroll_and_select_user(
             display_name=display_name,
             item=element,
             covered_targets=plan_entry.match.covered_targets,
+            stable_index=stable_index,
+            authority_proof=authority_proof,
         )
         # 只有调用方完成唯一一次 Enter、编辑器清空验证并继续迭代时，才把本逻辑
         # 会话覆盖的全部配置别名一起移除。发送会让会话重排，所以剩余会话仍须
@@ -1006,6 +1901,302 @@ def _get_unique_empty_editor(page: Any, timeout_ms: int) -> Any:
     if _read_slate_user_text(chat_input):
         raise EditorSafetyError("消息编辑器存在未发送旧草稿，已在输入前终止")
     return chat_input
+
+
+def _install_enter_authority_guard(
+    chat_input: Any,
+    selection: ConfirmedConversation,
+) -> None:
+    """解析权威引用，并把一次性同步 validator 原子 arm 到预装门禁。
+
+    Python 的最后一次 proof 读取与 Playwright ``press`` 之间仍有协议往返，IM 顺序
+    可能恰在这个窗口变化。最早 window capture listener 已由 context init script
+    预装；本函数只异步解析 remote factory，捕获严格校验过的 manager/SDK/link/store
+    引用，随后在同一个 JavaScript 任务内把纯同步 validator arm 到既有门禁。真实
+    keydown 到达时不再 await，并复核完整 authority、active 会话与同一编辑器。
+    """
+
+    if (
+        type(selection.stable_index) is not int
+        or selection.stable_index < 0
+        or not isinstance(
+            selection.authority_proof,
+            ConversationAuthoritySnapshot,
+        )
+        or not selection.authority_proof.is_terminal
+    ):
+        raise ConversationSelectionError(
+            "Enter 守卫缺少稳定索引或权威快照，已禁止发送"
+        )
+    proof = selection.authority_proof
+    expected = {
+        "stableIndex": selection.stable_index,
+        "displayName": selection.display_name,
+        "hasMore": proof.has_more,
+        "sdkIsLoading": proof.sdk_is_loading,
+        "storeIsLoading": proof.store_is_loading,
+        "orderedIds": list(proof.ordered_ids),
+        "participantSecUserIds": list(proof.participant_sec_user_ids),
+        "editorSelector": CHAT_EDITOR_SELECTOR,
+        "itemSelector": CONVERSATION_ITEM_SELECTOR,
+        "itemTitleSelector": CONVERSATION_TITLE_SELECTOR,
+        "currentClass": CURRENT_CONVERSATION_CLASS,
+        "rightTitleSelector": RIGHT_PANEL_TITLE_SELECTOR,
+    }
+    try:
+        status = chat_input.evaluate(
+            r"""async (editor, expected) => {
+                /* installEnterAuthorityGuard */
+                const guardKey = "__DOUYIN_SPARK_FLOW_ENTER_GUARD_V1__";
+                const armed = "ENTER_AUTHORITY_GUARD_ARMED";
+                const setupError = "ENTER_AUTHORITY_GUARD_SETUP_ERROR";
+                try {
+                    const gate = window[guardKey];
+                    if (
+                        !editor
+                        || !editor.isConnected
+                        || !gate
+                        || gate.version !== 1
+                        || typeof gate.arm !== "function"
+                        || !Number.isSafeInteger(expected.stableIndex)
+                        || expected.stableIndex < 0
+                        || !Array.isArray(expected.orderedIds)
+                        || expected.orderedIds.length === 0
+                        || !Array.isArray(expected.participantSecUserIds)
+                        || expected.participantSecUserIds.length
+                            !== expected.orderedIds.length
+                        || expected.stableIndex >= expected.orderedIds.length
+                    ) return setupError;
+
+                    const listPluginValues = (plugins) => {
+                        if (Array.isArray(plugins)) return Array.from(plugins);
+                        if (plugins instanceof Map || plugins instanceof Set) {
+                            return Array.from(plugins.values());
+                        }
+                        if (plugins && typeof plugins === "object") {
+                            return Reflect.ownKeys(plugins).map((key) => plugins[key]);
+                        }
+                        return null;
+                    };
+                    const findUniqueLinkOwner = (sdkValue) => {
+                        const values = listPluginValues(sdkValue && sdkValue.plugins);
+                        if (values === null) return null;
+                        const owners = values.filter((plugin) => (
+                            plugin !== null
+                            && (typeof plugin === "object" || typeof plugin === "function")
+                            && Object.prototype.hasOwnProperty.call(
+                                plugin,
+                                "initLinkInstance",
+                            )
+                        ));
+                        return owners.length === 1 ? owners[0] : null;
+                    };
+                    const normalizeTitle = (value) => String(value)
+                        .normalize("NFKC")
+                        .replace(/[\u200b\ufeff]/gu, "")
+                        .replace(/\s+/gu, " ")
+                        .trim();
+
+                    const remoteNames = Object.getOwnPropertyNames(window).filter(
+                        (name) => name.startsWith("__VMOK_@pc-im/im:"),
+                    );
+                    if (remoteNames.length !== 1) return setupError;
+                    const remoteName = remoteNames[0];
+                    const remote = window[remoteName];
+                    if (!remote || typeof remote.get !== "function") return setupError;
+                    // remote.get 是守卫安装阶段唯一允许的 await。它发生在监听器
+                    // 生效之前；keydown 的证明读取与站点 Enter 处理之间绝不让出
+                    // JavaScript 事件循环。
+                    const factory = await remote.get(".");
+                    if (typeof factory !== "function") return setupError;
+                    const exportsObject = factory();
+                    const context = exportsObject
+                        && exportsObject.Context
+                        && exportsObject.Context.instance;
+                    const manager = context
+                        && context.imSdkService
+                        && context.imSdkService.imSdkManager;
+                    if (!manager || typeof manager.getImSdkInstance !== "function") {
+                        return setupError;
+                    }
+                    const sdk = manager.getImSdkInstance();
+                    const linkOwner = findUniqueLinkOwner(sdk);
+                    const link = linkOwner && linkOwner.initLinkInstance;
+                    const store = window.conversationStore;
+                    if (!link || !store) return setupError;
+
+                    const authorityMatches = () => {
+                        const currentRemoteNames = Object.getOwnPropertyNames(window).filter(
+                            (name) => name.startsWith("__VMOK_@pc-im/im:"),
+                        );
+                        if (
+                            currentRemoteNames.length !== 1
+                            || currentRemoteNames[0] !== remoteName
+                            || window[remoteName] !== remote
+                            || window.conversationStore !== store
+                            || manager.getImSdkInstance() !== sdk
+                        ) return false;
+                        const currentLinkOwner = findUniqueLinkOwner(sdk);
+                        if (
+                            !currentLinkOwner
+                            || currentLinkOwner.initLinkInstance !== link
+                        ) return false;
+                        const nextParams = link.nextParams;
+                        const orderedIds = store.sortedConversationIdList;
+                        const conversationMap = store.conversationMap;
+                        return (
+                            nextParams
+                            && Array.isArray(orderedIds)
+                            && conversationMap
+                            && typeof conversationMap.get === "function"
+                            && nextParams.hasMore === expected.hasMore
+                            && link.isLoading === expected.sdkIsLoading
+                            && store.isLoading === expected.storeIsLoading
+                            && orderedIds.length === expected.orderedIds.length
+                            && orderedIds.every(
+                                (value, index) => value === expected.orderedIds[index],
+                            )
+                            && orderedIds.every((conversationId, index) => {
+                                const record = conversationMap.get(conversationId);
+                                return (
+                                    record
+                                    && record.toParticipantSecUserId
+                                        === expected.participantSecUserIds[index]
+                                );
+                            })
+                        );
+                    };
+
+                    const domAndEventMatch = (event, gateEditor) => {
+                        if (
+                            event.defaultPrevented
+                            || !event.isTrusted
+                            || event.shiftKey
+                            || event.ctrlKey
+                            || event.altKey
+                            || event.metaKey
+                            || event.repeat
+                            || event.isComposing
+                        ) return false;
+                        const editors = document.querySelectorAll(
+                            expected.editorSelector,
+                        );
+                        if (
+                            editors.length !== 1
+                            || editors[0] !== editor
+                            || gateEditor !== editor
+                            || !editor.isConnected
+                        ) return false;
+                        const eventTarget = event.target;
+                        const focused = document.activeElement;
+                        if (
+                            !eventTarget
+                            || !(
+                                eventTarget === editor
+                                || editor.contains(eventTarget)
+                            )
+                            || !focused
+                            || !(
+                                focused === editor
+                                || editor.contains(focused)
+                            )
+                        ) return false;
+
+                        const activeItems = document.querySelectorAll(
+                            `${expected.itemSelector}.${expected.currentClass}`,
+                        );
+                        if (activeItems.length !== 1) return false;
+                        const activeItem = activeItems[0];
+                        if (
+                            !activeItem.isConnected
+                            || !activeItem.classList.contains(expected.currentClass)
+                        ) return false;
+                        const indexedAncestor = activeItem.closest("[data-index]");
+                        const rawIndex = indexedAncestor
+                            && indexedAncestor.getAttribute("data-index");
+                        if (
+                            !indexedAncestor
+                            || !/^(0|[1-9]\d*)$/.test(rawIndex || "")
+                            || rawIndex !== String(expected.stableIndex)
+                        ) return false;
+                        const itemTitles = activeItem.querySelectorAll(
+                            expected.itemTitleSelector,
+                        );
+                        const rightTitles = document.querySelectorAll(
+                            expected.rightTitleSelector,
+                        );
+                        return (
+                            itemTitles.length === 1
+                            && rightTitles.length === 1
+                            && normalizeTitle(itemTitles[0].textContent || "")
+                                === expected.displayName
+                            && normalizeTitle(rightTitles[0].textContent || "")
+                                === expected.displayName
+                        );
+                    };
+
+                    // arm 前先证明捕获到的引用与 Python proof 完全一致。之后到
+                    // gate.arm 没有 await，页面不能在中间提交另一个状态；真正
+                    // keydown 会由 init script 预装的最早 listener 调用此 validator。
+                    if (!authorityMatches()) return setupError;
+                    const validator = (event, gateEditor) => {
+                        let proofStillValid = false;
+                        try {
+                            proofStillValid = (
+                                authorityMatches()
+                                && domAndEventMatch(event, gateEditor)
+                            );
+                        } catch (_ignored) {
+                            proofStillValid = false;
+                        }
+                        return proofStillValid;
+                    };
+                    return gate.arm(validator) === true ? armed : setupError;
+                } catch (_ignored) {
+                    return setupError;
+                }
+            }""",
+            expected,
+        )
+    except Exception:
+        raise ConversationSelectionError(
+            "安装 Enter 权威守卫失败，已禁止发送"
+        ) from None
+    if status != ENTER_AUTHORITY_GUARD_ARMED:
+        raise ConversationSelectionError(
+            "Enter 权威守卫未能安全就绪，已禁止发送"
+        )
+
+
+def _consume_enter_authority_guard_status(page: Any) -> str:
+    """读取一次守卫状态并清空 arm；预装 capture listener 保留到 context 销毁。"""
+
+    try:
+        status = page.evaluate(
+            """() => {
+                /* consumeEnterAuthorityGuardStatus */
+                const guardKey = "__DOUYIN_SPARK_FLOW_ENTER_GUARD_V1__";
+                const guard = window[guardKey];
+                try {
+                    if (!guard || typeof guard.consume !== "function") {
+                        return "ENTER_AUTHORITY_GUARD_STATUS_MISSING";
+                    }
+                    // consume 在页面闭包内先取本次 keydown 结果，再同步清空 validator
+                    // 和 arm 状态。最早注册的 listener 不移除，下一次发送仍先于站点。
+                    const currentStatus = guard.consume();
+                    return typeof currentStatus === "string"
+                        ? currentStatus
+                        : "ENTER_AUTHORITY_GUARD_STATUS_ERROR";
+                } catch (_ignored) {
+                    return "ENTER_AUTHORITY_GUARD_STATUS_ERROR";
+                }
+            }"""
+        )
+    except Exception:
+        raise ConversationSelectionError(
+            "读取并清理 Enter 权威守卫失败，提交状态不可信"
+        ) from None
+    return status if isinstance(status, str) else "ENTER_AUTHORITY_GUARD_STATUS_ERROR"
 
 
 def _wait_for_editor_cleared(
@@ -1082,6 +2273,9 @@ def do_user_task(
         identity_index: Dict[str, Set[FriendIdentity]] = {}
         context = browser.new_context()
         configure_browser_context(context, task_config)
+        # 必须先注册 context init script，再创建首个 page；否则站点可能已经在
+        # window capture 上抢先注册 Enter 发送处理器，晚装门禁无法保证先阻断。
+        _preinstall_enter_capture_gate(context)
 
         page = context.new_page()
         response_handler = partial(
@@ -1120,6 +2314,23 @@ def do_user_task(
             friend_list_wait_time=task_config["friendListTimeout"],
             confirmation_timeout=task_config["browserTimeout"],
         ):
+            # ConfirmedConversation 保留两个 Optional 仅用于旧调用方构造兼容；真实
+            # 发送路径绝不能因此退回 DOM-only。必须在取得编辑器、构建消息或输入
+            # 任何字符之前证明生成器携带了稳定索引与完整 authority 快照。
+            if (
+                type(selection.stable_index) is not int
+                or selection.stable_index < 0
+                or not isinstance(
+                    selection.authority_proof,
+                    ConversationAuthoritySnapshot,
+                )
+                or not selection.authority_proof.is_terminal
+                or selection.stable_index
+                >= len(selection.authority_proof.ordered_ids)
+            ):
+                raise ConversationSelectionError(
+                    "已确认会话缺少稳定索引或权威快照，已在编辑器操作前终止"
+                )
             chat_input = _get_unique_empty_editor(
                 page,
                 task_config["browserTimeout"],
@@ -1131,6 +2342,8 @@ def do_user_task(
                 page,
                 selection.item,
                 selection.display_name,
+                expected_stable_index=selection.stable_index,
+                expected_authority=selection.authority_proof,
             ):
                 raise ConversationSelectionError(
                     "输入前会话双重证据已失效，已终止当前账号"
@@ -1153,6 +2366,8 @@ def do_user_task(
                 page,
                 selection.item,
                 selection.display_name,
+                expected_stable_index=selection.stable_index,
+                expected_authority=selection.authority_proof,
             ):
                 raise ConversationSelectionError(
                     "消息构建后会话双重证据已失效，未执行输入"
@@ -1165,15 +2380,38 @@ def do_user_task(
                 page,
                 selection.item,
                 selection.display_name,
+                expected_stable_index=selection.stable_index,
+                expected_authority=selection.authority_proof,
             ):
                 raise ConversationSelectionError(
                     "Enter 前会话或编辑器唯一性证据已失效，未执行发送按键"
                 )
 
             logger.debug("账号 %s 已输入消息并完成 Enter 前安全核验", username)
-            # Enter 是不可安全重试的副作用边界：此处只执行一次，之后只观察同一
-            # 编辑器是否清空，不通过 retry_operation 包裹。
-            chat_input.press("Enter")
+            # Python proof 与 press 之间仍有浏览器协议窗口，因此先在页面 window
+            # capture 安装一次性守卫。真实 keydown 内会同步复核完整 authority、
+            # active 会话与同一编辑器；失配时事件在站点处理器之前即被阻断。
+            _install_enter_authority_guard(chat_input, selection)
+            try:
+                # Enter 是不可安全重试的副作用边界：无论 Playwright 返回、抛错或
+                # 页面守卫拒绝，本函数都只调用一次 press。
+                chat_input.press("Enter")
+            except BaseException:
+                try:
+                    _consume_enter_authority_guard_status(page)
+                except Exception:
+                    # 清理失败不能覆盖原始按键异常；账号上下文仍会关闭，且绝不
+                    # 据此重试可能已经到达页面的 Enter。
+                    pass
+                raise
+            guard_status = _consume_enter_authority_guard_status(page)
+            if guard_status != ENTER_AUTHORITY_GUARD_ALLOWED:
+                raise ConversationSelectionError(
+                    "Enter 到达页面时权威会话或编辑器证据已变化，按键已被守卫阻止"
+                )
+
+            # 只有 capture guard 明确记录 allowed 后才观察同一编辑器清空；armed、
+            # blocked、missing 或任何固定错误状态都不会进入提交确认阶段。
             _wait_for_editor_cleared(
                 page,
                 chat_input,
