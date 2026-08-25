@@ -1121,6 +1121,25 @@ class TaskReliabilityTests(unittest.TestCase):
                     tasks._read_authoritative_conversation_snapshot(page)
                 self.assertNotIn("合成机密ID", str(caught.exception))
 
+    def test_authority_reader_accepts_empty_participant_for_system_conversation(self):
+        """群组或系统会话可没有对端 sec_uid，但其空槽位仍须进入顺序 proof。"""
+
+        page = FakePage(
+            authority_raw=make_authority_raw(
+                2,
+                participant_sec_user_ids=["", "合成参与者sec_uid-1"],
+            )
+        )
+
+        proof = tasks._read_authoritative_conversation_snapshot(page)
+
+        # 线上 32 个会话中有 6 个空 participant。保留空字符串可让原子边界继续
+        # 比较完整位置；正式强身份计划会自然忽略空槽，绝不能把它当作目标身份。
+        self.assertEqual(
+            proof.participant_sec_user_ids,
+            ("", "合成参与者sec_uid-1"),
+        )
+
     def test_authority_evaluate_exception_is_redacted_and_fails_closed(self):
         """页面 evaluate 异常正文不能泄漏，且不得降级为 DOM-only 扫描。"""
 

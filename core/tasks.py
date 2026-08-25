@@ -729,6 +729,9 @@ def _read_authoritative_conversation_snapshot(
     store_is_loading = raw_snapshot.get("storeIsLoading")
     ordered_ids = raw_snapshot.get("orderedIds")
     participant_sec_user_ids = raw_snapshot.get("participantSecUserIds")
+    # 线上群组/系统会话的 ``toParticipantSecUserId`` 合法地返回空字符串。空槽仍是
+    # ordered ID 同位置 proof 的一部分，原子点击和 Enter 必须逐项比较它；正式
+    # 目标计划只会 join 非空 FriendIdentity.sec_uid，因此空槽不会获得发送授权。
     if (
         type(has_more) is not bool
         or type(sdk_is_loading) is not bool
@@ -743,7 +746,7 @@ def _read_authoritative_conversation_snapshot(
         or not isinstance(participant_sec_user_ids, list)
         or len(participant_sec_user_ids) != len(ordered_ids)
         or any(
-            not isinstance(participant_id, str) or not participant_id.strip()
+            not isinstance(participant_id, str)
             for participant_id in participant_sec_user_ids
         )
     ):
