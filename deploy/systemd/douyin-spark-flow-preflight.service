@@ -33,7 +33,6 @@ TasksMax=256
 # 三轮网络导航与列表选择器等待的理论上限可能超过五分钟；十分钟只影响故障兜底，
 # 不会延长正常预检，避免网络抖动时被 systemd 提前终止而产生假失败。
 TimeoutStartSec=10min
-RuntimeMaxSec=10min
 OOMPolicy=stop
 UMask=0077
 NoNewPrivileges=true

@@ -32,7 +32,6 @@ MemoryHigh=1G
 MemoryMax=1536M
 TasksMax=256
 TimeoutStartSec=30min
-RuntimeMaxSec=30min
 OOMPolicy=stop
 UMask=0077
 
