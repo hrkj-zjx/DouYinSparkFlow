@@ -1,0 +1,56 @@
+[Unit]
+Description=DouYin Spark Flow read-only browser preflight
+Documentation=https://github.com/hrkj-zjx/DouYinSparkFlow
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/douyin-spark-flow/config.env
+ConditionPathExists=/opt/douyin-spark-flow/app/main.py
+
+[Service]
+Type=oneshot
+User=douyin-spark-flow
+Group=douyin-spark-flow
+WorkingDirectory=/opt/douyin-spark-flow/app
+
+Environment=DOUYIN_ENV_FILE=/etc/douyin-spark-flow/config.env
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/douyin-spark-flow/browsers
+Environment=PYTHONUNBUFFERED=1
+Environment=BROWSER_HEADLESS=true
+Environment=BLOCK_BROWSER_RESOURCES=true
+Environment=LOG_FILE=/var/log/douyin-spark-flow/preflight.log
+Environment=HOME=/var/lib/douyin-spark-flow
+
+# 预检只打开聊天列表，代码路径中没有好友点击、输入框定位或 Enter 操作。
+ExecStartPre=/opt/douyin-spark-flow/venv/bin/python main.py --validate
+ExecStart=/opt/douyin-spark-flow/venv/bin/python main.py --preflight
+
+# 与正式任务使用相同资源和安全沙箱，确保预检通过能代表真实部署环境可启动。
+Nice=10
+CPUQuota=100%
+MemoryHigh=1G
+MemoryMax=1536M
+TasksMax=256
+# 三轮网络导航与列表选择器等待的理论上限可能超过五分钟；十分钟只影响故障兜底，
+# 不会延长正常预检，避免网络抖动时被 systemd 提前终止而产生假失败。
+TimeoutStartSec=10min
+RuntimeMaxSec=10min
+OOMPolicy=stop
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/douyin-spark-flow /var/log/douyin-spark-flow
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=douyin-spark-flow-preflight

@@ -2,7 +2,7 @@
 
 ![cover](docs/images/cover.png)
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
 ![Playwright](https://img.shields.io/badge/Playwright-%E2%9C%94-green?logo=playwright)
 ![chrome-headless-shell](https://img.shields.io/badge/chrome--headless--shell-%E2%9C%94-brightgreen?logo=googlechrome)
 
@@ -14,7 +14,7 @@
 
 感谢所有为本项目做出贡献的开发者：
 
-[![contributors](https://contrib.rocks/image?repo=2061360308/DouYinSparkFlow)](https://github.com/2061360308/DouYinSparkFlow/graphs/contributors)
+[![contributors](https://contrib.rocks/image?repo=hrkj-zjx/DouYinSparkFlow)](https://github.com/hrkj-zjx/DouYinSparkFlow/graphs/contributors)
 
 ## 📌 项目介绍
 
@@ -43,21 +43,21 @@
 
 **部署方法：**
 
-1. 服务器Docker部署（推荐👍），操作说明见 [Docker部署说明](docs/Docker部署说明.md)
+1. 服务器源码 + systemd 部署（已有 Python、追求最小常驻开销时推荐），操作说明见[源代码部署说明](docs/源代码部署说明.md)
 
-2. Github Action 部署，操作说明见 [Action部署说明](docs/Action部署说明.md)
+2. 服务器 Docker 部署（重视环境隔离时推荐），操作说明见 [Docker部署说明](docs/Docker部署说明.md)
 
-3. 源码部署 （更适合高级用户），操作说明见[源代码部署说明](docs/源代码部署说明.md)
+3. Github Action 部署，操作说明见 [Action部署说明](docs/Action部署说明.md)
 
 ## 📢交流讨论
 
 已开放讨论区，有疑问或展示相关成果，发布话题需求的可以加入讨论
 
-[跳转讨论区](https://github.com/2061360308/DouYinSparkFlow/discussions)
+[跳转讨论区](https://github.com/hrkj-zjx/DouYinSparkFlow/discussions)
 
 ## ⭐Star 趋势
 
-[![Star History Chart](https://api.star-history.com/svg?repos=2061360308/DouYinSparkFlow&type=Date)](https://www.star-history.com/#2061360308/DouYinSparkFlow&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=hrkj-zjx/DouYinSparkFlow&type=Date)](https://www.star-history.com/#hrkj-zjx/DouYinSparkFlow&Date)
 
 ## ⚠️ 免责声明
 

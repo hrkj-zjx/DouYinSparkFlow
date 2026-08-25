@@ -6,3 +6,6 @@ logs/
 .DS_Store
 usersData.json
 .env
+# 真实部署配置含登录 Cookie，任何层级都不得进入 Git 暂存区。
+**/.env
+config/

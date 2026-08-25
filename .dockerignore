@@ -1,7 +1,13 @@
 .git
 .github
 .env
+# Docker 的根级 `.env` 规则不会可靠覆盖嵌套配置；显式排除所有层级，
+# 防止 `config/.env` 中的 Cookie 被复制进镜像层。
+**/.env
+config/
 logs/
+docs/
+tests/
 __pycache__/
 **/__pycache__/
 *.pyc

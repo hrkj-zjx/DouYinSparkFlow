@@ -1,0 +1,57 @@
+[Unit]
+Description=DouYin Spark Flow headless task
+Documentation=https://github.com/hrkj-zjx/DouYinSparkFlow
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/douyin-spark-flow/config.env
+ConditionPathExists=/opt/douyin-spark-flow/app/main.py
+
+[Service]
+Type=oneshot
+User=douyin-spark-flow
+Group=douyin-spark-flow
+WorkingDirectory=/opt/douyin-spark-flow/app
+
+# 应用自行读取站外 0640 配置，Cookie 不进入 systemd EnvironmentFile 转储。
+Environment=DOUYIN_ENV_FILE=/etc/douyin-spark-flow/config.env
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/douyin-spark-flow/browsers
+Environment=PYTHONUNBUFFERED=1
+Environment=BROWSER_HEADLESS=true
+Environment=BLOCK_BROWSER_RESOURCES=true
+Environment=LOG_FILE=/var/log/douyin-spark-flow/app.log
+Environment=HOME=/var/lib/douyin-spark-flow
+
+# 每次执行先做无浏览器配置校验；失败时主任务不会启动。
+ExecStartPre=/opt/douyin-spark-flow/venv/bin/python main.py --validate
+ExecStart=/opt/douyin-spark-flow/venv/bin/python main.py
+
+# 一个账号串行运行通常远低于这些上限；硬限制用于保护同机其他生产服务。
+Nice=10
+CPUQuota=100%
+MemoryHigh=1G
+MemoryMax=1536M
+TasksMax=256
+TimeoutStartSec=30min
+RuntimeMaxSec=30min
+OOMPolicy=stop
+UMask=0077
+
+# 源码和配置只读，只有专用状态/日志目录与 PrivateTmp 可写。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/douyin-spark-flow /var/log/douyin-spark-flow
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=douyin-spark-flow

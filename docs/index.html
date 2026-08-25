@@ -1,43 +1,47 @@
-<html>
+<!DOCTYPE html>
+<html lang="zh-CN">
 
 <head>
-    <title>DouYinSparkFlow 配置生成器</title>
+    <!-- 明确字符集和视口，保证静态生成器在不同设备上使用一致的排版基准。 -->
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DouYinSparkFlow 配置生成器</title>
     <link rel="icon" href="./static/favicon.ico" type="image/x-icon" />
-    <!-- 导入样式 -->
+    <!-- 保留项目现有 Element Plus 视觉体系，并在 main.css 中只做必要的布局修复。 -->
     <link rel="stylesheet" href="./static/css/element-plus/index.css" />
     <link rel="stylesheet" href="./static/css/main.css" />
-    <!-- 导入图标 -->
-    <script src="./static/js/icons-vue.js"></script>
-    <!-- 导入 Vue 3 -->
+    <!-- 页面只使用内嵌 SVG，无需加载额外图标脚本，从而减少静态资源开销。 -->
+    <!-- Vue 与 Element Plus 均使用仓库内静态文件，配置内容不会提交到远程服务。 -->
     <script src="./static/js/vue.global.js"></script>
-    <!-- 导入组件库 -->
     <script src="./static/js/element-plus.js"></script>
 </head>
 
 <body>
     <div id="app">
-        <el-container style="height: calc(100% - 40px);">
+        <!-- h1 提供唯一页面标题；Logo 的替代文本不重复标题内容。 -->
+        <el-container class="page-container">
             <el-header>
                 <div class="page-header">
-                    <img src="./static/favicon.ico" alt="Logo" class="logo" />
-                    <span class="text-large font-600 ml-3"> DouYinSparkFlow 配置生成器 </span>
+                    <img src="./static/favicon.ico" alt="" class="logo" />
+                    <h1>DouYinSparkFlow 配置生成器</h1>
                 </div>
             </el-header>
-            <el-container style="height: calc(100% - 100px);">
-                <el-aside width="550px">
+            <!-- 桌面端保持左右布局，窄视口由 CSS 自然折叠，不改变表单交互。 -->
+            <el-container class="content-container">
+                <el-aside class="config-aside" width="550px">
                     <div>
                         <el-card id="environment-variables">
                             <template #header>
                                 <div class="card-header">
-                                    <span>Environment Variables</span>
+                                    <h2>环境变量（Environment Variables）</h2>
                                 </div>
                             </template>
                             <div v-for="(value, key) in environmentVariables" :key="key" class="config-item">
                                 <span class="label">{{ key }}</span>
                                 <div class="action">
                                     <el-button-group>
-                                        <el-button size="small" @click="copyValue(key)">
+                                        <el-button size="small" :aria-label="`复制 ${key} 变量名`"
+                                            @click="copyValue(key)">
                                             <template #icon>
                                                 <i class="icon"><svg t="1775398168345" class="icon"
                                                         viewBox="0 0 1024 1024" version="1.1"
@@ -49,7 +53,8 @@
                                             </template>
                                             变量名
                                         </el-button>
-                                        <el-button size="small" @click="copyValue(value)">
+                                        <el-button size="small" :aria-label="`复制 ${key} 变量值`"
+                                            @click="copyValue(value)">
                                             <template #icon>
                                                 <i class="icon"><svg t="1775398168345" class="icon"
                                                         viewBox="0 0 1024 1024" version="1.1"
@@ -61,7 +66,8 @@
                                             </template>
                                             变量值
                                         </el-button>
-                                        <el-button size="small" @click="openEnvDetails(key, value)">
+                                        <el-button size="small" :aria-label="`查看 ${key} 详情`"
+                                            @click="openEnvDetails(key, value)">
                                             <template #icon>
                                                 <i class="icon"><svg t="1775398487803" class="icon"
                                                         viewBox="0 0 1024 1024" version="1.1"
@@ -81,14 +87,15 @@
                         <el-card id="environment-secrets">
                             <template #header>
                                 <div class="card-header">
-                                    <span>Environment Secrets</span>
+                                    <h2>敏感变量（Environment Secrets）</h2>
                                 </div>
                             </template>
                             <div v-for="(value, key) in environmentSecrets" :key="key" class="config-item">
                                 <span class="label">{{ key }}</span>
                                 <div class="action">
                                     <el-button-group>
-                                        <el-button size="small" @click="copyValue(key)">
+                                        <el-button size="small" :aria-label="`复制 ${key} 变量名`"
+                                            @click="copyValue(key)">
                                             <template #icon>
                                                 <i class="icon"><svg t="1775398168345" class="icon"
                                                         viewBox="0 0 1024 1024" version="1.1"
@@ -101,7 +108,8 @@
                                             </template>
                                             变量名
                                         </el-button>
-                                        <el-button size="small" @click="copyValue(value)">
+                                        <el-button size="small" :aria-label="`复制 ${key} 变量值`"
+                                            @click="copyValue(value)">
                                             <template #icon>
                                                 <i class="icon"><svg t="1775398168345" class="icon"
                                                         viewBox="0 0 1024 1024" version="1.1"
@@ -114,7 +122,8 @@
                                             </template>
                                             变量值
                                         </el-button>
-                                        <el-button size="small" @click="openEnvDetails(key, value)">
+                                        <el-button size="small" :aria-label="`查看 ${key} 详情`"
+                                            @click="openEnvDetails(key, value)">
                                             <template #icon>
                                                 <i class="icon"><svg t="1775398487803" class="icon"
                                                         viewBox="0 0 1024 1024" version="1.1"
@@ -132,7 +141,9 @@
                             </div>
                         </el-card>
 
-                        <el-button style="width: 100%;" @click="copyEnvFile()">
+                        <!-- 两种部署格式共享同一套必填和 Cookie 安全校验。 -->
+                        <div class="config-copy-actions">
+                        <el-button class="copy-env-button" @click="copyEnvFile()">
                             <template #icon>
                                 <i class="icon"><svg t="1775398168345" class="icon" viewBox="0 0 1024 1024"
                                         version="1.1" xmlns="http://www.w3.org/2000/svg" p-id="12394" width="256"
@@ -144,21 +155,26 @@
                             </template>
                             复制 .env 配置文件
                         </el-button>
+                        <el-button class="copy-env-button" @click="copyGithubConfig()">
+                            复制 GitHub Secret（DOUYIN_CONFIG_JSON）
+                        </el-button>
+                        </div>
                     </div>
                 </el-aside>
                 <el-main>
                     <div class="main">
+                        <!-- 基础配置保持既有字段顺序，使用 h2 建立清晰的页面层级。 -->
                         <div class="base-config-form">
                             <div class="section-header">
-                                <span class="text-large font-600">基础配置</span>
+                                <h2>基础配置</h2>
                             </div>
-                            <el-form :model="form" label-width="auto" style="max-width: 600px">
+                            <el-form :model="form" label-width="auto" class="config-form">
                                 <el-form-item label="代理地址（暂未实现）">
                                     <el-input v-model="form.PROXY_ADDRESS" />
                                 </el-form-item>
                                 <el-form-item label="执行时间（仅Docker部署有效）">
                                     <el-time-picker v-model="form.RUN_TIME" format="HH:mm:ss" value-format="HH:mm:ss"
-                                        placeholder="09:00:00" />
+                                        :clearable="false" placeholder="09:00:00" @change="ensureRunTime" />
                                 </el-form-item>
                                 <el-form-item label="时区">
                                     <el-select v-model="form.TZ" placeholder="Asia/Shanghai">
@@ -203,24 +219,29 @@
                                 </el-form-item>
                             </el-form>
                         </div>
+                        <!-- 账户字段全部参与复制前校验，required 属性负责显示明确的必填标记。 -->
                         <div class="account-config-form">
                             <div class="section-header">
-                                <span class="text-large font-600">账户配置</span>
+                                <h2>账户配置</h2>
                             </div>
+                            <p class="required-hint"><span aria-hidden="true">*</span> 为必填项，填写完整后才能复制配置。</p>
                             <div class="account-item" v-for="(account, index) in form.ACCOUNTS" :key="index">
-                                <el-form :model="form" label-width="auto" style="max-width: 600px">
-                                    <el-form-item label="用户名">
-                                        <el-input v-model="account.username" />
+                                <el-form :model="account" label-width="auto" class="config-form">
+                                    <el-form-item label="用户名" required>
+                                        <el-input v-model="account.username" autocomplete="off"
+                                            placeholder="用于区分任务账户" />
                                     </el-form-item>
-                                    <el-form-item label="抖音号">
-                                        <el-input v-model="account.unique_id" />
+                                    <el-form-item label="抖音号" required>
+                                        <el-input v-model="account.unique_id" autocomplete="off"
+                                            placeholder="仅限字母、数字和下划线，且不可重复" />
                                     </el-form-item>
-                                    <el-form-item label="Cookies【JSON格式】">
-                                        <el-input v-model="account.cookies" :rows="4" type="textarea" />
+                                    <el-form-item label="Cookies【JSON格式】" required>
+                                        <el-input v-model="account.cookies" :rows="4" type="textarea"
+                                            autocomplete="off" placeholder="粘贴 Cookie-Editor 导出的非空 JSON 数组" />
                                     </el-form-item>
-                                    <el-form-item label="目标好友（回车）">
-                                        <el-input-tag v-model="account.targets" :tag-type="info" :tag-effect="plain"
-                                            placeholder="Please input">
+                                    <el-form-item label="目标好友（回车）" required>
+                                        <el-input-tag v-model="account.targets" tag-type="info" tag-effect="plain"
+                                            placeholder="输入好友后按回车添加">
                                             <template #tag="{ value }">
                                                 <div class="flex items-center">
                                                     <span>{{ value }}</span>
@@ -228,14 +249,13 @@
                                             </template>
                                         </el-input-tag>
                                     </el-form-item>
-                                    <el-button type="danger"
-                                        :style="{ width: '100%', margin: '20px auto' , display: form.ACCOUNTS.length <= 1 ? 'none' : 'block'}"
+                                    <el-button v-if="form.ACCOUNTS.length > 1" type="danger" class="remove-account-button"
                                         @click="removeAccount(index)">移除</el-button>
                                 </el-form>
 
                             </div>
                             <div class="action">
-                                <el-button type="primary" style="width: 80%; margin: 20px auto;" @click="addAccount">
+                                <el-button type="primary" class="add-account-button" @click="addAccount">
                                     <template #icon>
                                         <i class="icon"><svg t="1775401233918" class="icon" viewBox="0 0 1024 1024"
                                                 version="1.1" xmlns="http://www.w3.org/2000/svg" p-id="16333"
@@ -259,7 +279,8 @@
             </el-container>
         </el-container>
     </div>
+    <!-- 业务脚本最后加载，确保挂载时 #app 和表单模板已经存在。 -->
+    <script src="./static/js/main.js"></script>
 </body>
-<script src="./static/js/main.js"></script>
 
 </html>

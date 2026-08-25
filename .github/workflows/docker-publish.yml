@@ -9,6 +9,9 @@ on:
       - Dockerfile
       - docker-compose.yml
       - requirements.txt
+      - main.py
+      - core/**
+      - utils/**
       - docker/**
       - .github/workflows/docker-publish.yml
 
@@ -17,7 +20,32 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # 镜像只能在当前提交通过完整离线测试后发布，避免单独的质量工作流失败时仍推送镜像。
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q main.py core utils tests
+
+      - name: Run isolated unit tests
+        run: python -m unittest discover -s tests -v
+
   publish:
+    # 同一工作流内建立强依赖，确保登录镜像仓库和推送操作不会早于测试成功发生。
+    needs: test
     runs-on: ubuntu-latest
 
     steps:

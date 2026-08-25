@@ -1,4 +1,8 @@
 name: DouYin Spark Flow Schedule Run
+
+permissions:
+  contents: read
+
 on:
   workflow_dispatch: # 允许手动触发
   schedule: # 定时任务
@@ -11,7 +15,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     - name: Test Douyin Accessibility
@@ -19,22 +23,25 @@ jobs:
         curl -I https://creator.douyin.com/
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    - name: Ensure browsers are installed
-      run: playwright install chromium --with-deps --only-shell
-    - name: Export Github Environment Variables and Secrets to JSON
+        python -m pip install -r requirements.txt
+    - name: Export dedicated application configuration
       env:
-        VARS_JSON: ${{ toJson(vars) }}
-        SECRETS_JSON: ${{ toJson(secrets) }}
+        # 只向仓库内代码暴露一个专用 Secret，绝不枚举该环境的其他部署密钥。
+        DOUYIN_CONFIG_JSON: ${{ secrets.DOUYIN_CONFIG_JSON }}
       run: python utils/export_github_env.py
+    - name: Validate application configuration
+      run: python -m utils.config
+    - name: Install minimal headless browser
+      run: python -m playwright install chromium --with-deps --only-shell
     - name: Run DouYin Spark Flow
       run: python main.py
     - uses: actions/upload-artifact@v4
-      if: ${{ !cancelled() }}
+      # 日志可能包含账号标识，仅在失败时短期保留，减少隐私暴露面。
+      if: ${{ failure() }}
       with:
         name: run-logs
         path: logs/
+        retention-days: 3
   workflow-keepalive:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest

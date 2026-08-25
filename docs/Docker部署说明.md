@@ -4,6 +4,9 @@
 
 本项目支持通过 Docker 进行定时部署，适合部署在个人服务器、NAS 或支持 Docker 的运行环境中。
 
+宿主机不需要安装浏览器或桌面环境；镜像内已包含与 Playwright 版本匹配的
+Chromium Headless Shell 及系统运行库。
+
 当前推荐直接拉取已发布的镜像，再通过 `docker compose` 挂载配置文件和日志目录运行。
 
 ## 1. 准备运行环境
@@ -16,22 +19,23 @@
 ## 2. 拉取镜像
 
 ```bash
-docker pull ghcr.io/2061360308/douyinsparkflow:latest
+docker pull ghcr.io/hrkj-zjx/douyinsparkflow:latest
 ```
 
 ## 3. 准备配置目录
 
 Docker 部署时，程序会从容器内 `/app/.env` 读取配置。
 
-推荐在宿主机创建 `/etc/donyinsparkflow/config` 和 `/etc/donyinsparkflow/log` 两个目录，用于放置配置和日志。
+推荐在宿主机创建 `/etc/douyin-spark-flow` 和 `/var/log/douyin-spark-flow` 两个目录，用于放置配置和日志。配置放在仓库和 Docker 构建上下文之外，可避免 Cookie 被意外烘焙进镜像层。
 
 操作步骤如下：
 
-1. 在宿主机上创建 `/etc/donyinsparkflow/config` 目录。
-2. 将宿主机上的 `.env.example` 复制为 `/etc/donyinsparkflow/config/.env`。
+1. 在宿主机上创建 `/etc/douyin-spark-flow` 目录。
+2. 将宿主机上的 `.env.example` 复制为 `/etc/douyin-spark-flow/config.env`。
 3. 打开已经填写好的配置生成器页面，点击左侧最下方 `复制 .env 配置文件` 按钮。
 4. 将复制出的内容粘贴到 `config/.env` 中。
 5. 检查并确认以下字段已经正确填写：`CRON_HOUR`、`CRON_MINUTE`、`CRON_SECOND`、`TZ`、`TASKS`、`COOKIES_<unique_id>`。
+6. 执行 `chmod 0600 /etc/douyin-spark-flow/config.env` 限制 Cookie 文件权限。
 
 说明：
 
@@ -46,16 +50,21 @@ Docker 部署时，程序会从容器内 `/app/.env` 读取配置。
 ```yaml
 services:
   douyin-spark-flow:
-    image: ghcr.io/2061360308/douyinsparkflow:latest
+    image: ghcr.io/hrkj-zjx/douyinsparkflow:latest
     container_name: douyin-spark-flow
     restart: unless-stopped
+    init: true
+    cpus: "1.0"
+    mem_limit: 1536m
+    pids_limit: 256
     shm_size: 1gb
     environment:
-      GITHUB_ACTIONS: "true"
       PYTHONUNBUFFERED: "1"
+      BROWSER_HEADLESS: "true"
+      BLOCK_BROWSER_RESOURCES: "true"
     volumes:
-      - /etc/donyinsparkflow/config/.env:/app/.env:ro
-      - /etc/donyinsparkflow/log:/app/logs
+      - /etc/douyin-spark-flow/config.env:/app/.env:ro
+      - /var/log/douyin-spark-flow:/app/logs
 ```
 
 如果你想改成自定义路径，把上面的宿主机路径替换成你的实际路径即可。
@@ -76,7 +85,15 @@ docker compose -f compose.yml up -d
 docker compose -f compose.yml logs -f
 ```
 
-此外，项目运行日志会默认持久化到宿主机的 `/etc/donyinsparkflow/log` 目录，对应容器内路径为 `/app/logs`。
+此外，项目运行日志会默认持久化到宿主机的 `/var/log/douyin-spark-flow` 目录，对应容器内路径为 `/app/logs`。
+
+首次启用定时任务前，可在已启动容器中以正式的 `douyin` 用户和筛选后的运行时
+环境执行只读预检。它只打开聊天页并等待好友列表，不点击好友或发送消息：
+
+```bash
+docker compose -f compose.yml exec -T --user douyin douyin-spark-flow \
+  /bin/bash -lc 'source /etc/douyin-spark-flow.env; export DOUYIN_ENV_PRELOADED=1; cd /app; python main.py --preflight'
+```
 
 ## 7. 修改挂载路径（可选）
 
@@ -108,4 +125,4 @@ docker compose -f compose.yml ps
 2. 修改 `config/.env` 后，建议重启容器使新的定时配置立即生效。
 3. 如果只修改业务配置而不修改镜像内容，可直接执行 `docker compose -f compose.yml restart`。
 4. 若配置文件路径填写错误，容器启动时会直接报错退出。
-5. 如需排查问题，建议先将日志级别设置为 `DEBUG`，再结合 `docker compose logs -f` 观察输出。
+5. 如需排查问题，优先保留 `INFO` 级别并查看 `docker compose logs -f`；只有在确认日志保存位置安全后才临时启用 `DEBUG`。

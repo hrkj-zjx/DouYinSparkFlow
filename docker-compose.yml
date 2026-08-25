@@ -5,10 +5,16 @@ services:
       dockerfile: Dockerfile
     container_name: douyin-spark-flow
     restart: unless-stopped
+    # init 负责回收 Chromium 的子进程；资源上限防止异常页面影响宿主机其他服务。
+    init: true
+    cpus: "1.0"
+    mem_limit: 1536m
+    pids_limit: 256
     shm_size: 1gb
     environment:
-      GITHUB_ACTIONS: "true"
       PYTHONUNBUFFERED: "1"
+      BROWSER_HEADLESS: "true"
+      BLOCK_BROWSER_RESOURCES: "true"
     volumes:
       - ${CONFIG_ENV_FILE:-./config/.env}:/app/.env:ro
       - ${LOGS_DIR:-./logs}:/app/logs

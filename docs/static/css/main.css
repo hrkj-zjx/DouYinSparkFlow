@@ -1,3 +1,4 @@
+/* 使用统一盒模型，避免卡片和表单在计算宽度时因内边距产生横向溢出。 */
 *,
 *::before,
 *::after {
@@ -6,45 +7,103 @@
     box-sizing: border-box;
 }
 
+/* 页面高度由内容自然撑开，长配置不再受固定 100vh 高度限制。 */
+html,
+body {
+    min-height: 100%;
+}
+
 body {
     margin: 0;
-    padding: 0;
-    height: 100vh;
+    padding: 20px;
+    min-height: 100vh;
     background-color: #f0f0f0;
 }
 
+/* 内嵌 SVG 沿用原有按钮尺寸，不再依赖额外的图标脚本。 */
 .icon {
-    padding: 0px;
+    padding: 0;
     margin: 0;
     border: 0;
+    width: 1em;
+    height: 1em;
     font-size: 20px;
 }
 
+/* 修复原先缺少空格的 calc 表达式，并允许内容超过首屏后正常纵向滚动。 */
 #app {
-    background-color: #fff;
-    font-family: 'Arial', sans-serif;
+    width: 100%;
     max-width: 1400px;
-    height: calc(100%- 40px);
+    min-height: calc(100vh - 40px);
     margin: 0 auto;
     padding: 20px;
     border-radius: 8px;
+    background-color: #fff;
+    font-family: Arial, sans-serif;
 }
 
+/* Element Plus 的容器只承担布局，不再用固定高度裁剪账户表单。 */
+.page-container {
+    min-height: calc(100vh - 80px);
+}
+
+.page-container > .el-header {
+    height: auto;
+    padding: 0;
+}
+
+/* 标题继续采用项目原有的居中布局，并补全语义化 h1 的字号与行高。 */
 .page-header {
-    text-align: center;
-    margin-bottom: 20px;
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 10px;
+    margin-bottom: 20px;
     padding-bottom: 20px;
     border-bottom: 2px solid #eee;
+    text-align: center;
 }
 
+.page-header .logo {
+    width: 32px;
+    height: 32px;
+}
+
+.page-header h1 {
+    color: #303133;
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1.4;
+}
+
+/* 桌面端维持左侧 550px 预览、右侧表单的既有信息架构。 */
+.content-container {
+    align-items: flex-start;
+}
+
+.config-aside {
+    flex: 0 0 550px;
+    max-width: 100%;
+    overflow: visible;
+}
+
+.content-container > .el-main {
+    min-width: 0;
+}
+
+/* 卡片、列表与操作按钮沿用 Element Plus 视觉，仅统一必要的间距和换行规则。 */
 #environment-variables,
 #environment-secrets {
     margin-bottom: 10px;
     padding: 20px;
+}
+
+.card-header h2,
+.section-header h2 {
+    color: #303133;
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.4;
 }
 
 .config-item {
@@ -55,11 +114,35 @@ body {
     margin-bottom: 15px;
 }
 
+.config-item .label {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.copy-env-button,
+.remove-account-button {
+    width: 100%;
+}
+
+/* 部署格式按钮纵向排列，避免长名称在固定宽度侧栏中互相挤压。 */
+.config-copy-actions {
+    display: grid;
+    gap: 10px;
+}
+
+.config-copy-actions .el-button + .el-button {
+    margin-left: 0;
+}
+
 .main {
     display: flex;
     flex-direction: column;
     justify-content: center;
     gap: 20px;
+}
+
+.config-form {
+    max-width: 600px;
 }
 
 .base-config-form .section-header,
@@ -70,17 +153,139 @@ body {
     margin-bottom: 15px;
 }
 
+/* 必填说明同时使用星号和文字，不依赖颜色单独传达状态。 */
+.required-hint {
+    margin: 0 0 12px;
+    color: #606266;
+    font-size: 13px;
+    line-height: 1.5;
+    text-align: center;
+}
+
+.required-hint span {
+    color: #f56c6c;
+}
+
 .account-item {
-    background: #fafbfc;
+    margin-bottom: 16px;
+    padding: 16px;
     border: 1px solid #e4e7ed;
     border-radius: 6px;
-    padding: 16px;
-    margin-bottom: 16px;
+    background: #fafbfc;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
+}
+
+.remove-account-button {
+    margin: 20px auto;
 }
 
 .account-config-form .action {
     display: flex;
     justify-content: center;
     gap: 20px;
+}
+
+.add-account-button {
+    width: 80%;
+    margin: 20px auto;
+}
+
+/* 详情弹窗保留换行和长 JSON 的滚动能力，但内容仍由组件按纯文本渲染。 */
+.env-detail-message {
+    width: min(520px, 90vw);
+}
+
+.env-detail-message .el-message-box__message p {
+    max-height: 50vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* 中等宽度下只折叠主栏，避免固定侧栏挤压右侧表单造成横向滚动。 */
+@media (max-width: 960px) {
+    .content-container {
+        flex-direction: column;
+    }
+
+    .config-aside {
+        width: 100% !important;
+        flex-basis: auto;
+    }
+
+    .content-container > .el-main {
+        width: 100%;
+        padding: 20px 0 0;
+    }
+
+    .config-form {
+        max-width: none;
+    }
+}
+
+/* 极窄视口仅调整换行和可点击区域，不改变桌面布局或 Element Plus 组件风格。 */
+@media (max-width: 640px) {
+    body {
+        padding: 0;
+    }
+
+    #app {
+        min-height: 100vh;
+        padding: 12px;
+        border-radius: 0;
+    }
+
+    .page-container {
+        min-height: calc(100vh - 24px);
+    }
+
+    .page-header h1 {
+        font-size: 18px;
+    }
+
+    #environment-variables,
+    #environment-secrets {
+        padding: 0;
+    }
+
+    .config-item {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .config-item .action,
+    .config-item .el-button-group {
+        display: flex;
+        width: 100%;
+    }
+
+    .config-item .el-button {
+        flex: 1 1 0;
+    }
+
+    .config-form .el-form-item {
+        display: block;
+    }
+
+    .config-form .el-form-item__label,
+    .config-form .el-form-item__content {
+        width: 100%;
+    }
+
+    .config-form .el-form-item__label {
+        height: auto;
+        margin-bottom: 4px;
+        line-height: 1.5;
+    }
+
+    .config-form .el-select,
+    .config-form .el-date-editor,
+    .config-form .el-input-number,
+    .config-form .el-input-tag {
+        width: 100%;
+    }
+
+    .add-account-button {
+        width: 100%;
+    }
 }

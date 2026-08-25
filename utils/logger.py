@@ -1,9 +1,10 @@
 import logging
 import os
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
-LOG_FILE = "logs/app.log"
+DEFAULT_LOG_FILE = "logs/app.log"
 
 
 def resolve_log_level(level):
@@ -23,9 +24,16 @@ def resolve_log_level(level):
     return logging.INFO
 
 
-def setup_logger(name="app", level="Info"):
+def setup_logger(name="app", level="Info", log_file: Optional[str] = None):
+    """创建控制台与轮转文件日志器。
+
+    ``LOG_FILE`` 允许 systemd 把日志写入专用可写目录，而不是给应用源码目录写
+    权限。文件处理器使用延迟打开，单纯导入模块或执行配置校验不会创建空日志。
+    """
+
     resolved_level = resolve_log_level(level)
-    os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+    resolved_log_file = log_file or os.getenv("LOG_FILE", DEFAULT_LOG_FILE)
+    os.makedirs(os.path.dirname(resolved_log_file) or ".", exist_ok=True)
 
     logger = logging.getLogger(name)
     logger.setLevel(resolved_level)
@@ -36,10 +44,11 @@ def setup_logger(name="app", level="Info"):
     if not logger.handlers:
         console_handler = logging.StreamHandler()
         file_handler = RotatingFileHandler(
-            LOG_FILE,
+            resolved_log_file,
             maxBytes=5 * 1024 * 1024,
             backupCount=3,
             encoding="utf-8",
+            delay=True,
         )
         logger.addHandler(console_handler)
         logger.addHandler(file_handler)

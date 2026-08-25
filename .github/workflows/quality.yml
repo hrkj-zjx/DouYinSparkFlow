@@ -1,0 +1,41 @@
+name: Python Quality
+
+on:
+  push:
+  pull_request:
+
+# 质量检查不需要写仓库、包或 Actions 状态，保持最小权限。
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 同时覆盖依赖支持的最低版本与线上服务器使用的 Python 3.13。
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q main.py core utils tests
+
+      - name: Run isolated unit tests
+        run: python -m unittest discover -s tests -v

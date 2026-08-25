@@ -1,0 +1,13 @@
+[Unit]
+Description=Run DouYin Spark Flow every day at 09:00 Asia/Shanghai
+
+[Timer]
+# 显式写入时区，不依赖服务器全局时区；不补跑错过的时刻，避免重启后意外发送。
+OnCalendar=*-*-* 09:00:00 Asia/Shanghai
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=douyin-spark-flow.service
+
+[Install]
+WantedBy=timers.target

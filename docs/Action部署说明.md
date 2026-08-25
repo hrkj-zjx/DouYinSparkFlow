@@ -35,21 +35,22 @@
 
 ![创建`user-data`环境图](images/屏幕截图%202026-02-14%20224915.png)
 
-## 4. 配置 Secrets 和 Variables
+## 4. 配置单一应用 Secret
 
-在你刚创建的 `user-data` Environment 中，分别配置 Variables 和 Secrets。
+在你刚创建的 `user-data` Environment 中，只配置一个本应用专用 Secret。这样
+工作流不会枚举或接触该 Environment 中其他项目的部署密钥。
 
 操作步骤如下：
 
-1. 打开已经填写好的配置生成器页面，先查看左侧上方`Environment Variables` 区域。
-2. 进入 GitHub 仓库的 `Settings` -> `Environments` -> `user-data` -> `Environment variables`，逐条新增对应变量。
-3. 回到配置生成器，查看左侧下方 `Environment Secrets` 区域。
-4. 进入 GitHub 仓库的 `Settings` -> `Environments` -> `user-data` -> `Environment secrets`，逐条新增对应密钥。
+1. 在配置生成器中填写并核对全部配置。
+2. 点击 `复制 GitHub Secret（DOUYIN_CONFIG_JSON）`。
+3. 进入 GitHub 仓库的 `Settings` -> `Environments` -> `user-data` -> `Environment secrets`。
+4. 新建名为 `DOUYIN_CONFIG_JSON` 的 Secret，把复制内容完整粘贴为值。
 
 注意事项：
 
-- 变量名和变量值请与配置生成器保持完全一致（包含大小写）建议直接使用复制按钮复制粘贴。
-- 不要把 Secrets 内容填到 Variables，也不要把 Variables 内容填到 Secrets。
+- 不要再把整个 `secrets` 上下文导出给脚本，也不要把 Cookie 放入 Variables。
+- 更新账号、目标或 Cookie 后，需要重新生成并覆盖这个 Secret。
 
 ![配置生成器](images/配置生成器.png)
 
