@@ -220,15 +220,20 @@ class FakeChatInput:
         clear_after_enter=True,
         element_count=1,
         placeholder_text="",
+        editor_structure="standard",
     ):
         self.actions = []
         self.text = initial_text
         self.clear_after_enter = clear_after_enter
         self.element_count = element_count
         self.placeholder_text = placeholder_text
+        # standard 模拟既有 Slate，custom 模拟生产 data-node/data-string 空态，
+        # markerless/void 则用于证明未知或非文本内容始终失败关闭。
+        self.editor_structure = editor_structure
         self.owner_page = None
         self.before_enter_hook = None
         self.last_guard_script = None
+        self.last_content_state_script = None
 
     def count(self):
         # Playwright Locator 的 count 用于证明页面里只有一个真实可编辑节点。
@@ -250,7 +255,29 @@ class FakeChatInput:
         self.text += value
 
     def evaluate(self, expression, expected=None):
-        """模拟在同一编辑器元素上安装 window capture Enter 守卫。"""
+        """模拟原子草稿分类或在同一编辑器上安装 Enter 守卫。"""
+
+        if "readEditorContentState" in expression:
+            self.last_content_state_script = expression
+            if self.editor_structure in {"markerless", "detached"}:
+                return tasks.EDITOR_CONTENT_UNKNOWN
+            if self.editor_structure == "void":
+                return tasks.EDITOR_CONTENT_PRESENT
+            if self.editor_structure == "standard_multiple_empty_blocks":
+                return tasks.EDITOR_CONTENT_PRESENT
+            if self.editor_structure == "custom":
+                return (
+                    tasks.EDITOR_CONTENT_EMPTY
+                    if self.text == "\u200b"
+                    else tasks.EDITOR_CONTENT_PRESENT
+                )
+            # 标准空态允许测试用的 zero-width 字符；纯空格属于真实用户输入，
+            # 不能再被 norm/trim 静默当成空编辑器。
+            return (
+                tasks.EDITOR_CONTENT_EMPTY
+                if self.text in {"", "\ufeff", "\u200b"}
+                else tasks.EDITOR_CONTENT_PRESENT
+            )
 
         if "installEnterAuthorityGuard" not in expression:
             raise AssertionError("未预期的编辑器 evaluate 脚本")
@@ -277,7 +304,13 @@ class FakeChatInput:
             # 站点若使用 keydown 发送，会在同一事件传播内先于后续相位处理；只有
             # 最早 capture 已明确 allowed 时，fake 才模拟这一清空副作用。
             if keydown_allowed and self.clear_after_enter:
-                self.text = ""
+                # 生产自定义编辑器发送后恢复精确 U+200B 空标记；标准 Slate fake
+                # 则恢复 FEFF zero-width。不能用空字符串替代真实清空结构。
+                self.text = (
+                    "\u200b"
+                    if self.editor_structure == "custom"
+                    else "\ufeff"
+                )
             if self.owner_page is not None:
                 # 真实 Chromium 即使 keydown 被阻断仍会产生 keyup。fake 显式派发
                 # 全部潜在 Enter 相位，验证预装门禁不会让站点改用 keyup 绕过。
@@ -2518,6 +2551,103 @@ class TaskReliabilityTests(unittest.TestCase):
 
         self.assertIs(selected_editor, chat_input)
         self.assertIn((tasks.CHAT_EDITOR_SELECTOR, 1), chat_input_page.waited_selectors)
+        script = chat_input.last_content_state_script
+        self.assertIn("standardLeaves.length === 1", script)
+        self.assertIn("standardZeroWidths.length === 1", script)
+        self.assertIn('zeroWidth.getAttribute("data-slate-length") === "0"', script)
+
+    def test_live_custom_zero_width_empty_editor_is_accepted_atomically(self):
+        """生产 data-node/data-string/U+200B 空态应通过，且脚本不回传正文。"""
+
+        chat_input = FakeChatInput(
+            initial_text="\u200b",
+            editor_structure="custom",
+        )
+        page = FakePage(chat_input=chat_input)
+
+        selected_editor = tasks._get_unique_empty_editor(page, 1)
+
+        self.assertIs(selected_editor, chat_input)
+        script = chat_input.last_content_state_script
+        self.assertIn("readEditorContentState", script)
+        self.assertIn('span.childNodes[0].nodeValue === "\\u200b"', script)
+        self.assertIn('span.hasAttribute("data-enter")', script)
+        self.assertIn('span.hasAttribute("data-string")', script)
+
+    def test_live_custom_editor_returns_to_exact_empty_marker_after_enter(self):
+        """自定义编辑器完整发送路径应从 U+200B 空态出发并回到同一空态。"""
+
+        chat_input = FakeChatInput(
+            initial_text="\u200b",
+            editor_structure="custom",
+        )
+        page = FakePage(chat_input=chat_input, right_title="自定义编辑器好友")
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        item = FakeConversationItem("自定义编辑器好友", stable_index=0)
+        item.active = True
+        selection = tasks.ConfirmedConversation(
+            "自定义编辑器目标",
+            "自定义编辑器好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
+
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            return_value=[selection],
+        ), patch.object(tasks, "_build_message", return_value="一次可信提交"):
+            result = tasks.do_user_task(
+                browser,
+                "自定义编辑器账号",
+                [],
+                ["自定义编辑器目标"],
+                runtime_config=TEST_CONFIG,
+            )
+
+        self.assertEqual(result.state, tasks.TaskState.SUBMITTED_UNCONFIRMED)
+        self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
+        self.assertEqual(chat_input.text, "\u200b")
+        self.assertTrue(context.closed)
+
+    def test_whitespace_draft_is_not_normalized_into_empty_editor(self):
+        """用户只输入空格也属于旧草稿，不能被 trim/norm 后覆盖。"""
+
+        chat_input = FakeChatInput(initial_text="   ")
+        page = FakePage(chat_input=chat_input)
+
+        with self.assertRaises(tasks.EditorSafetyError):
+            tasks._get_unique_empty_editor(page, 1)
+
+        self.assertEqual(chat_input.actions, [])
+
+    def test_unknown_or_non_text_editor_content_fails_closed(self):
+        """无标记根与 void/附件态都不得被“无 string”误判为空。"""
+
+        for structure in ("markerless", "void", "standard_multiple_empty_blocks"):
+            with self.subTest(structure=structure):
+                chat_input = FakeChatInput(editor_structure=structure)
+                page = FakePage(chat_input=chat_input)
+
+                with self.assertRaises(tasks.EditorSafetyError):
+                    tasks._get_unique_empty_editor(page, 1)
+
+                self.assertEqual(chat_input.actions, [])
+
+    def test_editor_clear_confirmation_accepts_live_custom_empty_state(self):
+        """Enter 后编辑器恢复生产 U+200B 空态时，应确认清空而不重复按键。"""
+
+        chat_input = FakeChatInput(
+            initial_text="\u200b",
+            editor_structure="custom",
+        )
+        page = FakePage(chat_input=chat_input)
+
+        tasks._wait_for_editor_cleared(page, chat_input, timeout_ms=1)
+
+        self.assertEqual(chat_input.actions, [])
 
     def test_enter_is_not_retried_when_editor_does_not_clear(self):
         """Enter 后文本未清空属于失败；即使等待超时也只能按一次 Enter。"""

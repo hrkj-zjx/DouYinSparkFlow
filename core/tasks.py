@@ -63,11 +63,14 @@ CHAT_EDITOR_SELECTOR = (
     f'{CHAT_EDITOR_CONTAINER_SELECTOR} '
     '[data-slate-editor="true"][contenteditable="true"]'
 )
-# Slate 的 placeholder 与 zero-width 占位节点可能出现在编辑器的 innerText 中，但
-# 它们不是用户草稿。leaf 只用于证明 Slate 结构仍存在，真实文本则仅从 Slate
-# 专用的 data-slate-string 节点读取，显式排除上述两类占位内容。
+# 标准 Slate 与抖音当前自定义编辑器使用两套子节点标记。线上只读结构探测确认后者
+# 的空态为 data-node > data-leaf/data-string/data-enter，并仅含一个 U+200B；不能再
+# 把标准 data-slate-leaf 当成唯一结构证据，也不能仅凭没有 string 就猜测编辑器为空。
 SLATE_TEXT_LEAF_SELECTOR = '[data-slate-leaf="true"]'
 SLATE_TEXT_STRING_SELECTOR = '[data-slate-string="true"]'
+EDITOR_CONTENT_EMPTY = "EDITOR_CONTENT_EMPTY"
+EDITOR_CONTENT_PRESENT = "EDITOR_CONTENT_PRESENT"
+EDITOR_CONTENT_UNKNOWN = "EDITOR_CONTENT_UNKNOWN"
 
 # 页面渲染聊天任务不需要图片、音视频和字体。只拦截这些明确无关的资源，文档、
 # 脚本、XHR、fetch 与样式表仍放行，避免为了节省资源破坏站点核心逻辑。
@@ -2005,22 +2008,192 @@ def _type_multiline_message(chat_input: Any, message: str) -> None:
 
 
 def _read_slate_user_text(chat_input: Any) -> str:
-    """只读取 Slate string 中的用户文本，排除 placeholder 与零宽占位内容。
+    """原子区分已知空编辑器、已有内容与未知结构，不返回任何草稿正文。
 
-    空编辑器也应至少存在一个 ``data-slate-leaf``。如果站点改版后该结构消失，
-    返回猜测值可能把未知内容当作空草稿，因此这里直接抛出安全异常等待适配。
-    真正的用户字符由 ``data-slate-string`` 标记；空编辑器只有 zero-width 节点，
-    因而 string 列表为空是合法空值。读取后再次检查 leaf，避免 DOM 恰好在两次
-    查询之间被移除时把空结果错误地当作编辑器清空。
+    标准 Slate 空态由 leaf 与 zero-width 共同证明；抖音当前自定义空态则必须精确为
+    ``DIV[data-node] > SPAN[data-leaf][data-string][data-enter] > U+200B``。后者来自
+    生产只读探测，并在 0、250、1000、3000ms 四个观察点保持一致。除这两种白名单
+    外，普通文本、空格、void/媒体、markerless 根或任何未知子树一律失败关闭。
+
+    页面脚本只返回固定状态码，草稿内容不会跨过浏览器协议、更不会进入异常日志。
+    为兼容现有布尔调用方，已知空态返回空字符串，已有内容返回固定非空哨兵。
     """
 
-    leaves = chat_input.locator(SLATE_TEXT_LEAF_SELECTOR)
-    if leaves.count() < 1:
-        raise EditorSafetyError("Slate 文本叶节点不存在，无法安全判断草稿状态")
-    strings = chat_input.locator(SLATE_TEXT_STRING_SELECTOR).all_inner_texts()
-    if leaves.count() < 1:
-        raise EditorSafetyError("读取草稿期间 Slate 结构已变化，无法确认编辑器为空")
-    return _normalize_identity_value("\n".join(strings))
+    try:
+        state = chat_input.evaluate(
+            r"""(editor) => {
+                /* readEditorContentState */
+                const empty = "EDITOR_CONTENT_EMPTY";
+                const present = "EDITOR_CONTENT_PRESENT";
+                const unknown = "EDITOR_CONTENT_UNKNOWN";
+                try {
+                    if (
+                        !editor
+                        || !editor.isConnected
+                        || editor.getAttribute("data-slate-editor") !== "true"
+                        || editor.getAttribute("contenteditable") !== "true"
+                    ) return unknown;
+
+                    // void、附件或媒体即使没有文本，也属于不可覆盖的现有草稿。
+                    if (editor.querySelector(
+                        '[data-slate-void], [data-void], img, svg, canvas, video, audio, iframe, object',
+                    )) return present;
+
+                    const standardLeaves = editor.querySelectorAll(
+                        '[data-slate-leaf="true"]',
+                    );
+                    const standardStrings = editor.querySelectorAll(
+                        '[data-slate-string="true"]',
+                    );
+                    const standardZeroWidths = editor.querySelectorAll(
+                        "[data-slate-zero-width]",
+                    );
+                    if (standardStrings.length > 0) {
+                        // 包括纯空格在内的任何 string 节点都视为用户内容；不能用
+                        // trim/norm 把用户已经输入但尚未发送的空白草稿抹掉。
+                        return present;
+                    }
+                    if (
+                        standardLeaves.length === 1
+                        && standardZeroWidths.length === 1
+                    ) {
+                        const leaf = standardLeaves[0];
+                        const zeroWidth = standardZeroWidths[0];
+                        const zeroWidthKind = zeroWidth.getAttribute(
+                            "data-slate-zero-width",
+                        );
+                        const zeroWidthChildren = Array.from(
+                            zeroWidth.children,
+                        );
+                        const placeholders = Array.from(
+                            editor.querySelectorAll("[data-slate-placeholder]"),
+                        );
+                        const elementNodes = editor.querySelectorAll(
+                            '[data-slate-node="element"]',
+                        );
+                        const textNodes = editor.querySelectorAll(
+                            '[data-slate-node="text"]',
+                        );
+                        const zeroWidthIsCanonical = (
+                            leaf.contains(zeroWidth)
+                            && (zeroWidthKind === "n" || zeroWidthKind === "z")
+                            && zeroWidth.getAttribute("data-slate-length") === "0"
+                            && zeroWidth.textContent === "\ufeff"
+                            && (
+                                (
+                                    zeroWidthKind === "n"
+                                    && zeroWidthChildren.length === 1
+                                    && zeroWidthChildren[0].tagName === "BR"
+                                )
+                                || (
+                                    zeroWidthKind === "z"
+                                    && zeroWidthChildren.length === 0
+                                )
+                            )
+                        );
+                        const placeholdersAreCanonical = placeholders.every(
+                            (element) => (
+                                leaf.contains(element)
+                                && element.getAttribute("contenteditable") === "false"
+                            ),
+                        ) && placeholders.length <= 1;
+                        const elementNode = elementNodes.length === 1
+                            ? elementNodes[0]
+                            : null;
+                        const textNode = textNodes.length === 1
+                            ? textNodes[0]
+                            : null;
+                        const standardTreeIsCanonical = (
+                            elementNode
+                            && textNode
+                            && editor.children.length === 1
+                            && editor.children[0] === elementNode
+                            && elementNode.children.length === 1
+                            && elementNode.children[0] === textNode
+                            && textNode.children.length === 1
+                            && textNode.children[0] === leaf
+                            && leaf.children.length === placeholders.length + 1
+                            && Array.from(leaf.children).every(
+                                (element) => (
+                                    element === zeroWidth
+                                    || placeholders.includes(element)
+                                ),
+                            )
+                        );
+                        const clone = editor.cloneNode(true);
+                        clone.querySelectorAll(
+                            "[data-slate-zero-width], [data-slate-placeholder]",
+                        ).forEach((node) => node.remove());
+                        // 只接受一个规范 zero-width 叶节点。多个空段落可能是用户
+                        // 留下的换行草稿；未知无文本元素也不能靠 textContent 绕过。
+                        if (
+                            zeroWidthIsCanonical
+                            && placeholdersAreCanonical
+                            && standardTreeIsCanonical
+                            && clone.textContent === ""
+                            && !clone.querySelector('[contenteditable="false"]')
+                        ) return empty;
+                        return present;
+                    }
+
+                    const customNodes = editor.querySelectorAll(
+                        "[data-node]",
+                    );
+                    const customLeaves = editor.querySelectorAll(
+                        "[data-leaf]",
+                    );
+                    const customStrings = editor.querySelectorAll(
+                        "[data-string]",
+                    );
+                    const customEmptyMarkers = editor.querySelectorAll(
+                        "[data-enter]",
+                    );
+                    const block = editor.children.length === 1
+                        ? editor.children[0]
+                        : null;
+                    const span = block && block.children.length === 1
+                        ? block.children[0]
+                        : null;
+                    const exactCustomEmpty = (
+                        editor.childNodes.length === 1
+                        && customNodes.length === 1
+                        && customLeaves.length === 1
+                        && customStrings.length === 1
+                        && customEmptyMarkers.length === 1
+                        && block
+                        && block.tagName === "DIV"
+                        && block.hasAttribute("data-node")
+                        && block.childNodes.length === 1
+                        && span
+                        && span.tagName === "SPAN"
+                        && span.hasAttribute("data-leaf")
+                        && span.hasAttribute("data-string")
+                        && span.hasAttribute("data-enter")
+                        && span.children.length === 0
+                        && span.childNodes.length === 1
+                        && span.childNodes[0].nodeType === Node.TEXT_NODE
+                        && span.childNodes[0].nodeValue === "\u200b"
+                        && editor.textContent === "\u200b"
+                    );
+                    if (exactCustomEmpty) return empty;
+                    // 自定义 string 存在但不再符合唯一 U+200B 空态，说明已有用户
+                    // 输入（包括纯空格、多行空白）或结构化内容，必须保留。
+                    if (customStrings.length > 0) return present;
+                    return unknown;
+                } catch (_ignored) {
+                    return unknown;
+                }
+            }"""
+        )
+    except Exception:
+        raise EditorSafetyError(
+            "读取编辑器草稿状态失败，已禁止覆盖或发送"
+        ) from None
+    if state == EDITOR_CONTENT_EMPTY:
+        return ""
+    if state == EDITOR_CONTENT_PRESENT:
+        return EDITOR_CONTENT_PRESENT
+    raise EditorSafetyError("编辑器内容结构未知，无法安全判断草稿状态")
 
 
 def _get_unique_empty_editor(page: Any, timeout_ms: int) -> Any:
@@ -2028,8 +2201,8 @@ def _get_unique_empty_editor(page: Any, timeout_ms: int) -> Any:
 
     等待精确到 ``data-slate-editor`` 与 ``contenteditable=true`` 的节点，随后仍检查
     数量，避免 ``wait_for_selector`` 只返回首个元素而掩盖页面里并存的隐藏编辑器。
-    草稿只从 Slate string 读取，显式排除 placeholder 和 zero-width 占位节点；任意
-    实际字符都视为用户或上一次任务留下的草稿，自动化不得覆盖、拼接或发送。
+    草稿状态在同一次浏览器任务内按标准 Slate 或线上已确认的抖音自定义空态分类；
+    任意实际字符或未知结构都视为不可覆盖，自动化不得拼接或发送。
     """
 
     page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=timeout_ms)
