@@ -64,6 +64,46 @@ class IdentityIndexThatBecomesAmbiguous(dict):
         return super().get(key, default)
 
 
+class IdentityIndexWhoseAliasGroupChanges(dict):
+    """第二次读取时替换唯一身份，模拟计划后别名覆盖集合发生变化。"""
+
+    def __init__(self, display_name, initial_identity, changed_identity):
+        super().__init__({display_name: {initial_identity}})
+        self.display_name = display_name
+        self.changed_identity = changed_identity
+        self.read_count = 0
+
+    def get(self, key, default=None):
+        if key == self.display_name:
+            self.read_count += 1
+            if self.read_count == 2:
+                # 第一次读取建立两别名计划，第二次发生在点击前。这里仍保持身份
+                # 集合大小为 1，专门验证生产代码会比较完整身份与别名组快照，而
+                # 不是只看兼容字段 target_symbol 是否仍能命中。
+                self[key] = {self.changed_identity}
+        return super().get(key, default)
+
+
+class IdentityIndexWhoseOtherConversationStartsMatching(dict):
+    """第二次读取未选中显示名时，让它开始命中已选会话的同一别名。"""
+
+    def __init__(self, other_display_name, late_identity, initial):
+        super().__init__(initial)
+        self.other_display_name = other_display_name
+        self.late_identity = late_identity
+        self.other_read_count = 0
+
+    def get(self, key, default=None):
+        if key == self.other_display_name:
+            self.other_read_count += 1
+            if self.other_read_count == 2:
+                # 首次读取发生在原计划构建，第二次读取只能来自点击前完整重建。
+                # 被选中项自己的匹配完全不变，只有全计划重建才能看到同一别名
+                # 此刻落入两个会话，并在任何 click 之前整体取消。
+                self[key] = {self.late_identity}
+        return super().get(key, default)
+
+
 class FakeChatInput:
     """模拟唯一 Slate 编辑器，并可控制 Enter 后是否清空。"""
 
@@ -163,6 +203,7 @@ class FakeConversationItem:
         self.stable_index = stable_index
         self.activate_on_click = activate_on_click
         self.clicked = False
+        self.click_count = 0
         self.active = False
 
     def locator(self, selector):
@@ -174,6 +215,7 @@ class FakeConversationItem:
 
     def click(self):
         self.clicked = True
+        self.click_count += 1
         if self.activate_on_click:
             self.active = True
 
@@ -524,6 +566,199 @@ class TaskReliabilityTests(unittest.TestCase):
             )
         )
 
+    def test_same_identity_aliases_are_merged_into_one_conversation_click(self):
+        """同一唯一身份的两个配置别名必须只选择一次并显式覆盖整组。"""
+
+        identity = tasks.FriendIdentity(
+            short_id="配置别名甲",
+            unique_id="配置别名乙",
+            sec_uid="",
+            nickname="唯一好友",
+            remark_name="唯一好友",
+        )
+        identity_index = {"唯一好友": {identity}}
+        item = FakeConversationItem("唯一好友", stable_index=0)
+        page = FakeConversationListPage([item], right_title="唯一好友")
+
+        selections = list(
+            tasks.scroll_and_select_user(
+                page,
+                "别名归并账号",
+                ["配置别名甲", "配置别名乙"],
+                identity_index=identity_index,
+                friend_list_wait_time=1,
+                confirmation_timeout=1,
+            )
+        )
+
+        self.assertEqual(item.click_count, 1)
+        self.assertEqual(len(selections), 1)
+        self.assertEqual(selections[0].target_symbol, "配置别名甲")
+        self.assertEqual(
+            selections[0].covered_targets,
+            ("配置别名甲", "配置别名乙"),
+        )
+
+    def test_twelve_aliases_build_exactly_six_logical_conversations(self):
+        """复现线上配置形态：十二个标识成对归并后只能得到六个会话。"""
+
+        inventory = {}
+        identity_index = {}
+        targets = []
+        for stable_index in range(6):
+            display_name = f"合成好友{stable_index}"
+            first_alias = f"合成别名{stable_index}-甲"
+            second_alias = f"合成别名{stable_index}-乙"
+            identity = tasks.FriendIdentity(
+                short_id=first_alias,
+                unique_id=second_alias,
+                sec_uid=f"合成强身份-{stable_index}",
+                nickname=display_name,
+                remark_name=display_name,
+            )
+            inventory[stable_index] = display_name
+            identity_index[display_name] = {identity}
+            targets.extend((first_alias, second_alias))
+
+        plan = tasks._build_unique_selection_plan(
+            inventory,
+            targets,
+            identity_index,
+        )
+
+        # 计划项数量就是后续允许发生的最大点击/Enter 次数；覆盖数则证明十二个
+        # 配置标识都被唯一会话解释，没有通过静默丢弃别名来凑出六次发送。
+        self.assertEqual(len(plan), 6)
+        self.assertEqual(
+            sum(len(entry.match.covered_targets) for entry in plan.values()),
+            12,
+        )
+
+    def test_alias_that_also_matches_another_conversation_aborts_before_click(self):
+        """任一别名落入第二个会话时，整份计划必须零点击失败。"""
+
+        first_identity = tasks.FriendIdentity(
+            "配置别名甲", "配置别名乙", "", "好友甲", "好友甲"
+        )
+        second_identity = tasks.FriendIdentity(
+            "配置别名乙", "其他标识", "", "好友乙", "好友乙"
+        )
+        identity_index = {
+            "好友甲": {first_identity},
+            "好友乙": {second_identity},
+        }
+        first = FakeConversationItem("好友甲", stable_index=0)
+        second = FakeConversationItem("好友乙", stable_index=1)
+        page = FakeConversationListPage(
+            [first, second],
+            right_title="好友甲",
+        )
+
+        with self.assertRaises(tasks.ConversationSelectionError):
+            list(
+                tasks.scroll_and_select_user(
+                    page,
+                    "跨会话别名账号",
+                    ["配置别名甲", "配置别名乙"],
+                    identity_index=identity_index,
+                    friend_list_wait_time=1,
+                    confirmation_timeout=1,
+                )
+            )
+
+        self.assertEqual(first.click_count, 0)
+        self.assertEqual(second.click_count, 0)
+
+    def test_other_conversation_starting_to_match_aborts_before_any_click(self):
+        """原计划后未选中会话开始命中同一别名时，完整重建必须零点击失败。"""
+
+        selected_display = "原唯一会话"
+        other_display = "后到冲突会话"
+        target_alias = "唯一配置别名"
+        selected_identity = tasks.FriendIdentity(
+            "",
+            target_alias,
+            "原强身份",
+            selected_display,
+            selected_display,
+        )
+        unrelated_identity = tasks.FriendIdentity(
+            "",
+            "无关配置标识",
+            "无关强身份",
+            other_display,
+            other_display,
+        )
+        late_conflicting_identity = tasks.FriendIdentity(
+            "",
+            target_alias,
+            "后到强身份",
+            other_display,
+            other_display,
+        )
+        identity_index = IdentityIndexWhoseOtherConversationStartsMatching(
+            other_display,
+            late_conflicting_identity,
+            {
+                selected_display: {selected_identity},
+                other_display: {unrelated_identity},
+            },
+        )
+        selected_item = FakeConversationItem(selected_display, stable_index=0)
+        other_item = FakeConversationItem(other_display, stable_index=1)
+        page = FakeConversationListPage(
+            [selected_item, other_item],
+            right_title=selected_display,
+        )
+
+        with self.assertRaises(tasks.ConversationSelectionError):
+            list(
+                tasks.scroll_and_select_user(
+                    page,
+                    "全局重验竞态账号",
+                    [target_alias],
+                    identity_index=identity_index,
+                    friend_list_wait_time=1,
+                    confirmation_timeout=1,
+                )
+            )
+
+        self.assertEqual(identity_index.other_read_count, 2)
+        self.assertEqual(selected_item.click_count, 0)
+        self.assertEqual(other_item.click_count, 0)
+
+    def test_alias_group_change_after_plan_aborts_before_click(self):
+        """计划后唯一身份改为只覆盖部分别名时，完整组重验必须拒绝点击。"""
+
+        initial_identity = tasks.FriendIdentity(
+            "配置别名甲", "配置别名乙", "", "竞态好友", "竞态好友"
+        )
+        changed_identity = tasks.FriendIdentity(
+            "配置别名甲", "", "变化后安全标识", "竞态好友", "竞态好友"
+        )
+        identity_index = IdentityIndexWhoseAliasGroupChanges(
+            "竞态好友",
+            initial_identity,
+            changed_identity,
+        )
+        item = FakeConversationItem("竞态好友", stable_index=0)
+        page = FakeConversationListPage([item], right_title="竞态好友")
+
+        with self.assertRaises(tasks.ConversationSelectionError):
+            list(
+                tasks.scroll_and_select_user(
+                    page,
+                    "别名竞态账号",
+                    ["配置别名甲", "配置别名乙"],
+                    identity_index=identity_index,
+                    friend_list_wait_time=1,
+                    confirmation_timeout=1,
+                )
+            )
+
+        self.assertEqual(identity_index.read_count, 2)
+        self.assertEqual(item.click_count, 0)
+
     def test_identity_becoming_ambiguous_after_plan_aborts_before_click(self):
         """计划后新到同名响应时，点击前重验必须看到歧义并保持零点击。"""
 
@@ -764,6 +999,44 @@ class TaskReliabilityTests(unittest.TestCase):
             [action for action in chat_input.actions if action == ("press", "Shift+Enter")],
             [("press", "Shift+Enter"), ("press", "Shift+Enter")],
         )
+
+    def test_alias_group_is_submitted_once_and_covers_both_requested_targets(self):
+        """一次会话 Enter 清空后，结果应同时覆盖其两个请求别名。"""
+
+        chat_input = FakeChatInput()
+        page = FakePage(chat_input=chat_input, right_title="确认好友")
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        selected_item = FakeConversationItem("确认好友")
+        selected_item.active = True
+        selection = tasks.ConfirmedConversation(
+            target_symbol="配置别名甲",
+            display_name="确认好友",
+            item=selected_item,
+            covered_targets=("配置别名甲", "配置别名乙"),
+        )
+
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            return_value=[selection],
+        ), patch.object(tasks, "_build_message", return_value="只发送一次"):
+            result = tasks.do_user_task(
+                browser,
+                "别名提交账号",
+                [],
+                ["配置别名甲", "配置别名乙"],
+                runtime_config=TEST_CONFIG,
+            )
+
+        self.assertEqual(result.state, tasks.TaskState.SUBMITTED_UNCONFIRMED)
+        self.assertEqual(
+            result.submitted_targets,
+            ("配置别名甲", "配置别名乙"),
+        )
+        self.assertEqual(result.missing_targets, ())
+        self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
+        self.assertTrue(context.closed)
 
     def test_message_build_state_change_is_rechecked_before_first_type(self):
         """远程消息构建期间标题变化时，返回后必须在零输入状态终止。"""

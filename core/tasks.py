@@ -109,16 +109,49 @@ MutableIdentityIndex = MutableMapping[str, Set[FriendIdentity]]
 
 
 @dataclass(frozen=True)
+class _TargetAliasMatch:
+    """一个页面会话对配置标识的完整、不可变匹配快照。
+
+    ``covered_targets`` 保存同一好友身份命中的全部配置别名；``identity`` 则保存
+    计划建立时唯一的好友身份。点击前会同时比较这两个字段，既能发现别名组增减，
+    也能发现身份对象被另一条响应替换但恰好仍命中同样别名的竞态。
+    """
+
+    covered_targets: Tuple[str, ...]
+    identity: Optional[FriendIdentity] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _SelectionPlanEntry:
+    """全量库存中一个允许点击的唯一逻辑会话。"""
+
+    display_name: str
+    match: _TargetAliasMatch
+
+
+@dataclass(frozen=True)
 class ConfirmedConversation:
     """已通过双重 DOM 证据确认的会话选择结果。
 
-    ``item`` 保留被点击的同一个 Locator，使输入前和 Enter 前能够再次核验它仍是
-    当前会话；字段不参与业务比较，也不应写入日志，避免 Locator 的内部信息暴露。
+    ``target_symbol`` 保留旧版单目标调用方使用的首个配置标识；
+    ``covered_targets`` 显式列出该唯一会话覆盖的全部配置别名。``item`` 保留被
+    点击的同一个 Locator，使输入前和 Enter 前能够再次核验它仍是当前会话；该
+    Locator 不参与业务比较，也不应写入日志，避免其内部信息暴露。
     """
 
     target_symbol: str
     display_name: str
     item: Any = field(compare=False, repr=False)
+    covered_targets: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """让旧的单目标构造方式自动得到一致的别名覆盖集合。"""
+
+        if not self.covered_targets:
+            object.__setattr__(self, "covered_targets", (self.target_symbol,))
+            return
+        if self.covered_targets[0] != self.target_symbol:
+            raise ValueError("首个兼容目标必须与别名覆盖集合的首项一致")
 
 
 class ConversationSelectionError(RuntimeError):
@@ -299,6 +332,51 @@ def handle_response(
     return updated
 
 
+def _match_target_aliases(
+    display_name: str,
+    targets: Iterable[str],
+    identity_index: Optional[IdentityIndex] = None,
+    *,
+    allow_direct_display_match: bool = False,
+) -> Optional[_TargetAliasMatch]:
+    """返回一个唯一会话命中的全部配置别名及身份快照。
+
+    配置可能同时使用同一好友的短号、抖音号等多个标识。只有显示名在身份索引中
+    恰好对应一个 ``FriendIdentity`` 时，才允许把该身份命中的多个标识归并为一个
+    逻辑会话。无身份数据时的显示名直配仍须由已完成全局 DOM 盘点的调用方显式
+    开启。返回值不包含页面 Locator，也不会被写入日志。
+    """
+
+    normalized_name = _normalize_identity_value(display_name)
+    normalized_targets: List[str] = []
+    seen_targets: Set[str] = set()
+    for target in targets:
+        normalized = _normalize_identity_value(target)
+        if normalized and normalized not in seen_targets:
+            seen_targets.add(normalized)
+            normalized_targets.append(normalized)
+
+    index = identity_index if identity_index is not None else {}
+    identities = index.get(normalized_name)
+    if identities is not None:
+        # 零个或多个身份都不能证明当前 DOM 会话属于哪位好友；即使其中只有一条
+        # 身份命中配置，也不能从同名 DOM 推断它就是被点击的那一条。
+        if len(identities) != 1:
+            return None
+        identity = next(iter(identities))
+        identity_candidates = set(identity.candidates())
+        covered_targets = tuple(
+            target for target in normalized_targets if target in identity_candidates
+        )
+        if covered_targets:
+            return _TargetAliasMatch(covered_targets, identity)
+        return None
+
+    if allow_direct_display_match and normalized_name in seen_targets:
+        return _TargetAliasMatch((normalized_name,), None)
+    return None
+
+
 def checkTargetName(
     targetName: str,
     targets: Iterable[str],
@@ -306,41 +384,22 @@ def checkTargetName(
     *,
     allow_direct_display_match: bool = False,
 ) -> Optional[str]:
-    """把页面显示名解析为配置中的目标标识。
+    """把页面显示名解析为单个配置目标，并保留旧版兼容语义。
 
-    保留原有函数名和前两个参数，第三个参数用于传入账号私有索引。直接显示名匹配
-    默认关闭；只有调用方已经完成全列表稳定索引盘点并证明该显示名全局唯一时，才
-    能显式开启，避免首屏昵称命中后才在后续虚拟页发现同名好友。
+    新发送计划使用 ``_match_target_aliases`` 归并同一身份的多个别名；这个公开旧
+    函数仍只在恰好命中一个标识时返回字符串，避免既有单目标调用方悄然改变类型
+    或误把多别名结果当成任意一个目标。
     """
 
-    normalized_name = _normalize_identity_value(targetName)
-    normalized_targets = {
-        normalized
-        for target in targets
-        if (normalized := _normalize_identity_value(target))
-    }
-    index = identity_index or {}
-
-    identities = index.get(normalized_name)
-    if identities is not None:
-        # 同一显示名只要关联到零个或多个不同身份，就没有充分证据决定该点击谁。
-        # 即便多个身份中恰好只有一个能匹配配置，也不能假设当前 DOM 项就是它。
-        if len(identities) != 1:
-            return None
-        identity = next(iter(identities))
-        matched_candidates = {
-            candidate
-            for candidate in identity.candidates()
-            if candidate in normalized_targets
-        }
-        # 同一身份若同时命中多个配置目标，也会让“本轮完成的是哪个目标”变得不
-        # 唯一；此时不点击，要求配置方只保留一个明确标识。
-        if len(matched_candidates) == 1:
-            return next(iter(matched_candidates))
+    match = _match_target_aliases(
+        targetName,
+        targets,
+        identity_index,
+        allow_direct_display_match=allow_direct_display_match,
+    )
+    if match is None or len(match.covered_targets) != 1:
         return None
-    if allow_direct_display_match and normalized_name in normalized_targets:
-        return normalized_name
-    return None
+    return match.covered_targets[0]
 
 
 def _wait_for_page(page: Any, milliseconds: int) -> None:
@@ -684,12 +743,13 @@ def _build_unique_selection_plan(
     inventory: Mapping[int, str],
     targets: Sequence[str],
     identity_index: Optional[IdentityIndex],
-) -> Dict[int, Tuple[str, str]]:
-    """在第一次点击前证明每个配置目标恰好对应一个全局稳定索引。
+) -> Dict[int, _SelectionPlanEntry]:
+    """在第一次点击前证明每个配置标识恰好对应一个全局稳定会话。
 
     全列表中相同规范化标题若落在多个 ``data-index`` 上，相关标题不会进入候选。
-    身份接口同名多身份、一个目标被多个显示名命中、目标缺失或目标之间规范化重复
-    也都会让计划构建失败，因此不会出现“先给部分好友发送，后面才发现歧义”。
+    同一个唯一好友身份命中的多个配置别名会归入同一计划项；一个别名被不同会话
+    命中、身份接口同名多身份、别名缺失或目标规范化重复都会让整份计划在首次点击
+    前失败，避免“先给部分好友发送，后面才发现歧义”。
     """
 
     normalized_targets = tuple(_normalize_identity_value(target) for target in targets)
@@ -700,37 +760,47 @@ def _build_unique_selection_plan(
     for stable_index, display_name in inventory.items():
         display_to_indices.setdefault(display_name, set()).add(stable_index)
 
-    matches_by_target: Dict[str, List[Tuple[int, str]]] = {
+    matches_by_target: Dict[str, List[int]] = {
         target: [] for target in normalized_targets
     }
+    candidate_plan: Dict[int, _SelectionPlanEntry] = {}
     for display_name, stable_indices in display_to_indices.items():
         # 全局同名即使接口暂时只返回一个身份，也无法证明哪个索引对应它，全部跳过。
         if len(stable_indices) != 1:
             continue
-        target_symbol = checkTargetName(
+        match = _match_target_aliases(
             display_name,
             normalized_targets,
             identity_index=identity_index,
             allow_direct_display_match=True,
         )
-        if target_symbol is not None:
-            matches_by_target[target_symbol].append(
-                (next(iter(stable_indices)), display_name)
+        if match is not None:
+            stable_index = next(iter(stable_indices))
+            candidate_plan[stable_index] = _SelectionPlanEntry(
+                display_name=display_name,
+                match=match,
             )
+            for target_symbol in match.covered_targets:
+                matches_by_target[target_symbol].append(stable_index)
 
-    if any(len(matches) != 1 for matches in matches_by_target.values()):
+    invalid_target_count = sum(
+        1 for matches in matches_by_target.values() if len(matches) != 1
+    )
+    if invalid_target_count:
         raise ConversationSelectionError(
-            "至少一个配置目标没有且仅有一个全局稳定会话，发送计划已整体取消"
+            f"{invalid_target_count} 个配置标识没有且仅有一个全局稳定会话，"
+            "发送计划已整体取消"
         )
 
-    plan: Dict[int, Tuple[str, str]] = {}
-    for target_symbol, matches in matches_by_target.items():
-        stable_index, display_name = matches[0]
-        if stable_index in plan:
-            raise ConversationSelectionError(
-                "多个配置目标映射到同一会话索引，发送计划已整体取消"
-            )
-        plan[stable_index] = (target_symbol, display_name)
+    # ``matches_by_target`` 已证明每个标识只落到一个索引。这里按索引去重后，同一
+    # FriendIdentity 的多个别名自然合并为一次会话选择和一次 Enter。
+    selected_indices = {
+        matches[0] for matches in matches_by_target.values()
+    }
+    plan = {
+        stable_index: candidate_plan[stable_index]
+        for stable_index in selected_indices
+    }
     return plan
 
 
@@ -756,11 +826,7 @@ def scroll_and_select_user(
 
     remaining_targets = [_normalize_identity_value(target) for target in targets]
     while remaining_targets:
-        logger.debug(
-            "账号 %s 开始为剩余 %s 个目标只读预扫描全部好友会话",
-            username,
-            len(remaining_targets),
-        )
+        logger.debug("开始为剩余 %s 个配置标识只读预扫描全部好友会话", len(remaining_targets))
         inventory, list_handle = _scan_full_conversation_inventory(
             page,
             friend_list_wait_time,
@@ -770,13 +836,15 @@ def scroll_and_select_user(
             remaining_targets,
             identity_index,
         )
-        logger.debug(
-            "账号 %s 已完成 %s 个稳定会话的全量盘点，剩余目标均已唯一解析",
-            username,
+        logger.info(
+            "发送计划已通过唯一性校验：配置标识数=%s，唯一会话数=%s，"
+            "稳定库存会话数=%s",
+            len(remaining_targets),
+            len(plan),
             len(inventory),
         )
 
-        selected: Optional[Tuple[str, str, Any]] = None
+        selected: Optional[Tuple[_SelectionPlanEntry, Any]] = None
         for _ in range(MAX_INVENTORY_SCAN_ROUNDS):
             round_indices: Set[int] = set()
             for element in page.locator(CONVERSATION_ITEM_SELECTOR).all():
@@ -793,25 +861,25 @@ def scroll_and_select_user(
                 if stable_index not in plan:
                     continue
 
-                target_symbol, expected_display_name = plan[stable_index]
-                if display_name != expected_display_name:
+                plan_entry = plan[stable_index]
+                if display_name != plan_entry.display_name:
                     raise ConversationSelectionError(
                         "目标会话标题偏离本轮预扫描计划，已在输入前终止"
                     )
                 # response 回调可能在计划构建后继续补充同名身份。点击前必须基于
                 # 当前集合重算一次；若唯一身份变为歧义或改为命中另一目标，旧计划
                 # 立即失效，不能依赖几毫秒前的快照触碰会话。
-                current_target_symbol = checkTargetName(
+                current_match = _match_target_aliases(
                     display_name,
                     remaining_targets,
                     identity_index=identity_index,
                     allow_direct_display_match=True,
                 )
-                if current_target_symbol != target_symbol:
+                if current_match != plan_entry.match:
                     raise ConversationSelectionError(
-                        "点击前好友身份映射已变化或变得不唯一，发送计划已取消"
+                        "点击前好友身份或别名覆盖集合已变化，发送计划已取消"
                     )
-                selected = (target_symbol, display_name, element)
+                selected = (plan_entry, element)
                 break
 
             if selected is not None:
@@ -829,7 +897,29 @@ def scroll_and_select_user(
                 "发送阶段超过安全扫描轮数，列表状态无法确认"
             )
 
-        target_symbol, display_name, element = selected
+        plan_entry, element = selected
+        display_name = plan_entry.display_name
+
+        # 逐项重验只能证明“当前待点击会话”仍覆盖原别名，却看不到另一个未选中的
+        # 显示名是否刚被新到达的好友身份响应补成了同一别名。此时原会话的匹配值
+        # 可以完全不变，但全局唯一性已经失效。因而在副作用边界前，必须用同一份
+        # 只读 DOM 库存和当前最新身份索引完整重建计划；任何构建异常或计划差异都
+        # 在 element.click() 之前终止，绝不把局部稳定误当成全局稳定。
+        try:
+            refreshed_plan = _build_unique_selection_plan(
+                inventory,
+                remaining_targets,
+                identity_index,
+            )
+        except Exception as exc:
+            raise ConversationSelectionError(
+                "点击前完整发送计划无法重新通过唯一性校验，已取消点击"
+            ) from exc
+        if refreshed_plan != plan:
+            raise ConversationSelectionError(
+                "点击前完整发送计划已变化，已取消点击"
+            )
+
         try:
             element.click()
             _wait_for_confirmed_conversation(
@@ -845,16 +935,18 @@ def scroll_and_select_user(
                 "点击目标会话或读取切换证据失败，已在输入前终止"
             ) from exc
 
-        logger.debug("账号 %s 的目标会话已通过全局唯一与双重 DOM 证据", username)
+        logger.debug("一个目标会话已通过全局唯一与双重 DOM 证据")
         yield ConfirmedConversation(
-            target_symbol=target_symbol,
+            target_symbol=plan_entry.match.covered_targets[0],
             display_name=display_name,
             item=element,
+            covered_targets=plan_entry.match.covered_targets,
         )
-        # 只有调用方完成 Enter 后清空验证并继续迭代时，才把该目标从本次内存计划
-        # 移除。发送会让会话重排，所以剩余目标必须重新做一轮完整只读库存扫描；
-        # data-index 从不跨发送复用，也就不会把新的位置误当成旧会话身份。
-        remaining_targets.remove(target_symbol)
+        # 只有调用方完成唯一一次 Enter、编辑器清空验证并继续迭代时，才把本逻辑
+        # 会话覆盖的全部配置别名一起移除。发送会让会话重排，所以剩余会话仍须
+        # 重新完整盘点；data-index 从不跨发送复用，避免把新位置当作旧会话身份。
+        for covered_target in plan_entry.match.covered_targets:
+            remaining_targets.remove(covered_target)
 
 
 def _split_message_lines(message: str) -> List[str]:
@@ -1087,10 +1179,14 @@ def do_user_task(
                 chat_input,
                 task_config["browserTimeout"],
             )
-            submitted_targets.append(selection.target_symbol)
+            # 一个已确认会话可能覆盖同一 FriendIdentity 的多个配置别名，但消息只
+            # 按一次 Enter。清空证据成立后再把整组别名计入提交结果，防止别名组
+            # 被误判为部分缺失并在后续循环对同一好友重复发送。
+            submitted_targets.extend(selection.covered_targets)
             logger.info(
-                "账号 %s 的目标会话已确认且 Enter 后编辑器已清空，记为已提交但未确认送达",
-                username,
+                "一个目标会话已确认且 Enter 后编辑器已清空：覆盖配置标识数=%s，"
+                "记为已提交但未确认送达",
+                len(selection.covered_targets),
             )
 
         missing_targets = tuple(
