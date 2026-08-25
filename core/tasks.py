@@ -74,6 +74,10 @@ SLATE_TEXT_STRING_SELECTOR = '[data-slate-string="true"]'
 BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
 USER_INFO_URL_FRAGMENT = "aweme/v1/web/im/user/info"
 DOM_CONFIRM_POLL_INTERVAL_MS = 100
+# 目标项已经在原子快照中证明位于可交互区域，因此真实鼠标点击不应继续继承全局
+# 120 秒浏览器超时。限定为 5 秒可以在站点 actionability 异常时快速失败，同时仍给
+# Playwright 足够时间完成一次可信 pointer/mouse/click 事件序列。
+CONVERSATION_CLICK_TIMEOUT_MS = 5000
 # 原子 DOM 快照没有副作用；页面恰在整棵虚拟列表提交时可能短暂返回空数组或协议
 # 读取异常。最多三次、每次间隔 100ms 足以跨过一次常见重绘，又不会把永久页面
 # 结构变化拖入后续 500 轮滚动协议或掩盖需要适配的新 DOM。
@@ -959,14 +963,15 @@ def _click_conversation_at_authority_boundary(
     expected_display_name: str,
     authority_proof: ConversationAuthoritySnapshot,
 ) -> None:
-    """在同一个浏览器任务内复核权威顺序、索引和连接状态后执行一次点击。
+    """原子复核点击许可，再用 Playwright 发送一次可信鼠标点击。
 
     若先在 Python 读取 authority、再调用 Playwright ``click``，两次协议往返之间页面
-    仍可处理新的 IM 事件。这里改为 Locator.evaluate：浏览器在一个 JavaScript 任务
-    内完成全部比较并调用 DOM ``element.click()``，从而把最后证据检查与首个副作用
-    收敛到同一事件循环边界。异步 remote factory 在所有证明读取之前完成；从读取
-    proof 到 ``element.click()`` 之间没有任何 await。返回值只有固定错误码，ID 既
-    不写日志也不进入异常文本。
+    仍可处理新的 IM 事件。因此先由 Locator.evaluate 在同一个 JavaScript 任务内完成
+    authority、稳定索引、标题和几何证明，再立即调用 Playwright ``click``。不能在
+    页面内调用 ``HTMLElement.click()``：该 API 生成 ``isTrusted=false`` 且缺少完整
+    pointer/mouse 序列，抖音会直接忽略。可信点击只负责切换界面；随后的双 DOM 与
+    authority 复核仍是进入编辑器的唯一许可，所以协议间隙中若发生重排也不会输入。
+    返回值和异常只使用固定状态码，权威 ID 不进入日志。
     """
 
     expected = {
@@ -979,7 +984,7 @@ def _click_conversation_at_authority_boundary(
         "participantSecUserIds": list(authority_proof.participant_sec_user_ids),
     }
     try:
-        clicked = item.evaluate(
+        authorization_status = item.evaluate(
             r"""async (element, expected) => {
                 /* clickAtAuthoritativeConversationBoundary */
                 const rejected = "AUTHORITY_BOUNDARY_REJECTED";
@@ -1019,8 +1024,8 @@ def _click_conversation_at_authority_boundary(
                     if (remoteNames.length !== 1) return rejected;
                     const remote = window[remoteNames[0]];
                     if (!remote || typeof remote.get !== "function") return rejected;
-                    // 唯一 await 位于所有副作用边界证明之前。factory 返回后直到
-                    // element.click() 不再让出事件循环。
+                    // 唯一 await 位于全部许可证明之前。factory 返回后直到固定状态码
+                    // 返回都不再让出事件循环，保证本次只读授权来自同一个页面状态。
                     const factory = await remote.get(".");
                     if (typeof factory !== "function") return rejected;
                     const exportsObject = factory();
@@ -1126,11 +1131,10 @@ def _click_conversation_at_authority_boundary(
                             !== expected.orderedIds[expected.stableIndex]
                     ) return rejected;
 
-                    // 固定调用原生 HTMLElement click，避免页面在元素实例上覆盖同名
-                    // 属性改变副作用；站点若拒绝非 trusted 事件，后续双 DOM 证据会
-                    // fail-closed，绝不会直接进入编辑器输入。
-                    HTMLElement.prototype.click.call(element);
-                    return "AUTHORITY_BOUNDARY_CLICKED";
+                    // 页面内 DOM click 的 isTrusted=false，且不会产生完整的指针事件
+                    // 序列，线上站点可能静默忽略。这里只返回许可；Python 随后使用
+                    // Playwright 发送一次浏览器级可信点击，再执行原有后置严格复核。
+                    return "AUTHORITY_BOUNDARY_AUTHORIZED";
                 } catch (_ignored) {
                     return "AUTHORITY_BOUNDARY_ERROR";
                 }
@@ -1141,10 +1145,18 @@ def _click_conversation_at_authority_boundary(
         raise ConversationSelectionError(
             "权威会话点击边界执行失败，已在输入前终止"
         ) from None
-    if clicked != "AUTHORITY_BOUNDARY_CLICKED":
+    if authorization_status != "AUTHORITY_BOUNDARY_AUTHORIZED":
         raise ConversationSelectionError(
             "点击边界的会话权威状态或稳定索引已变化，已取消点击"
         )
+    try:
+        # Locator 仍由稳定 data-index 锚定，点击动作只执行一次。任何超时或页面重绘
+        # 都转成固定错误；调用方不会重试这一 UI 副作用，也不会继续到编辑器输入。
+        item.click(timeout=CONVERSATION_CLICK_TIMEOUT_MS)
+    except Exception:
+        raise ConversationSelectionError(
+            "目标会话可信点击失败，已在输入前终止"
+        ) from None
 
 
 def _conversation_selection_matches(

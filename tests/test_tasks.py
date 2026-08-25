@@ -322,6 +322,7 @@ class FakeConversationItem:
         self.activate_on_click = activate_on_click
         self.clicked = False
         self.click_count = 0
+        self.click_timeout = None
         self.active = False
         self.authority_page = None
         self.connected = True
@@ -335,7 +336,10 @@ class FakeConversationItem:
             return self.IndexedAncestor(self.stable_index)
         raise AssertionError(f"未预期的会话项选择器：{selector}")
 
-    def click(self):
+    def click(self, timeout=None):
+        """模拟独立的 Playwright 可信点击，并记录生产限定的点击超时。"""
+
+        self.click_timeout = timeout
         self.clicked = True
         self.click_count += 1
         if self.activate_on_click:
@@ -371,8 +375,9 @@ class FakeConversationItem:
             or current != expected_raw
         ):
             return "AUTHORITY_BOUNDARY_REJECTED"
-        self.click()
-        return "AUTHORITY_BOUNDARY_CLICKED"
+        # evaluate 只能完成原子只读授权，不能替代 Playwright 的可信鼠标事件。若在
+        # 这里直接激活会话，单测会再次掩盖浏览器拒绝 isTrusted=false 的线上回归。
+        return "AUTHORITY_BOUNDARY_AUTHORIZED"
 
     def get_attribute(self, attribute_name, timeout=None):
         if attribute_name != "class":
@@ -1334,7 +1339,12 @@ class TaskReliabilityTests(unittest.TestCase):
         self.assertIn("Number.isSafeInteger(expected.stableIndex)", click_script)
         self.assertIn("element.ownerDocument !== document", click_script)
         self.assertIn("element.matches(", click_script)
-        self.assertIn("HTMLElement.prototype.click.call(element)", click_script)
+        # 页面脚本只能完成原子授权；真正激活会话必须来自随后独立执行、带短超时
+        # 的 Playwright 可信点击，防止 fake 再次掩盖 isTrusted=false 的线上回归。
+        self.assertNotIn("HTMLElement.prototype.click.call(element)", click_script)
+        self.assertIn('return "AUTHORITY_BOUNDARY_AUTHORIZED"', click_script)
+        self.assertEqual(item.click_count, 1)
+        self.assertEqual(item.click_timeout, tasks.CONVERSATION_CLICK_TIMEOUT_MS)
 
     def test_authority_reader_rejects_wrong_types_duplicate_or_empty_ids(self):
         """权威字段必须严格为 bool 与非空、全局唯一的字符串有序列表。"""
