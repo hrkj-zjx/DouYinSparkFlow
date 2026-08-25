@@ -74,6 +74,10 @@ SLATE_TEXT_STRING_SELECTOR = '[data-slate-string="true"]'
 BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
 USER_INFO_URL_FRAGMENT = "aweme/v1/web/im/user/info"
 DOM_CONFIRM_POLL_INTERVAL_MS = 100
+# 原子 DOM 快照没有副作用；页面恰在整棵虚拟列表提交时可能短暂返回空数组或协议
+# 读取异常。最多三次、每次间隔 100ms 足以跨过一次常见重绘，又不会把永久页面
+# 结构变化拖入后续 500 轮滚动协议或掩盖需要适配的新 DOM。
+MAX_ATOMIC_DOM_SNAPSHOT_ATTEMPTS = 3
 MAX_INVENTORY_SCAN_ROUNDS = 500
 # 单次“从顶到底”扫描必须在底部连续取得三份完全相同的快照。两份快照只能证明
 # 一个等待间隔内没有变化，线上懒加载曾在更晚的等待周期才继续扩展列表，因此这里
@@ -148,6 +152,22 @@ class _SelectionPlanEntry:
 
     display_name: str
     match: _TargetAliasMatch
+
+
+@dataclass(frozen=True)
+class _ConversationDomItemSnapshot:
+    """一次浏览器事件循环内取得的会话项只读快照。
+
+    ``stable_index``、``display_name`` 与 ``actionable`` 必须来自同一次
+    ``Locator.evaluate_all``。它们不能再由 ``locator.all()`` 返回的动态 ``nth``
+    Locator 分步读取，否则虚拟列表在两次 Playwright 往返之间重绘时，第二次读取
+    可能已经指向另一项或零项。快照只授权后续继续核验，不直接授权点击；真正点击
+    仍由权威会话边界在同一个 JavaScript 任务内重新检查全部证据。
+    """
+
+    stable_index: int
+    display_name: str
+    actionable: bool
 
 
 @dataclass(frozen=True)
@@ -763,57 +783,174 @@ def _read_authoritative_conversation_snapshot(
     )
 
 
-def _conversation_item_is_actionable_in_list(item: Any) -> bool:
-    """只读判断会话项是否真正位于唯一列表容器的可交互区域内。
+def _read_atomic_conversation_dom_snapshot(
+    page: Any,
+) -> Tuple[_ConversationDomItemSnapshot, ...]:
+    """原子读取当前 DOM 窗口里的索引、标题与可操作性。
 
-    抖音虚拟列表会把视口上下方的 overscan 项继续留在 DOM 中；Locator 能找到这类
-    项，但它们尚未与滚动容器相交，不能据此提前选定点击候选。这里复用原子点击
-    边界的连接状态、样式和矩形相交约束，只返回布尔值且不产生点击、滚动或输入。
-    页面结构缺失或 evaluate 异常统一视为不可操作，让搜索继续向下滚动；若到达
-    底部仍没有真实可见目标，外层会按既有协议 fail-closed。
+    Playwright 的 ``locator.all()`` 只把当时的数量展开成一组仍会重新解析的 Locator，
+    并不会冻结元素。抖音虚拟列表恰好会在网络响应、滚动和布局提交时复用这些节点；
+    旧实现先 ``count()`` 再 ``get_attribute()``，两次协议往返之间因此存在明确的
+    TOCTOU 窗口。这里让浏览器在一个同步 JavaScript 任务内遍历全部匹配元素，
+    使最近 ``data-index`` 祖先、唯一标题和几何可见性属于同一时刻。
+
+    该函数只返回经过严格形状校验的脱敏对象。页面脚本异常、列表容器不唯一、元素
+    脱离、索引或标题结构异常都转换为固定 ``ConversationSelectionError``；调用方
+    仍会在 authority 前后快照一致时才合并数据，绝不会因消除 100ms 超时而放宽
+    完整库存或发送身份约束。
     """
 
-    try:
-        return item.evaluate(
-            """(element) => {
-                /* conversationItemIsActionableInList */
-                try {
-                    if (!element || !element.isConnected) return false;
-                    const listContainers = document.querySelectorAll(
-                        ".conversationConversationListwrapper",
-                    );
-                    if (listContainers.length !== 1) return false;
-                    const listContainer = listContainers[0];
+    raw_snapshot: Any = None
+    for attempt in range(MAX_ATOMIC_DOM_SNAPSHOT_ATTEMPTS):
+        try:
+            raw_snapshot = page.locator(CONVERSATION_ITEM_SELECTOR).evaluate_all(
+                r"""(elements, selectors) => {
+                /* readAtomicConversationDomSnapshot */
+                const listContainers = document.querySelectorAll(
+                    selectors.list,
+                );
+                const listContainer = listContainers.length === 1
+                    ? listContainers[0]
+                    : null;
+                const items = elements.map((element) => {
+                    // 从 parentElement 开始，保持原 ancestor::* 语义：列表项自身的
+                    // 偶然同名属性不能替代虚拟列表容器提供的稳定位置证明。
+                    const indexedAncestor = element.parentElement
+                        && element.parentElement.closest("[data-index]");
+                    const titles = element.querySelectorAll(selectors.title);
+                    let actionable = false;
                     if (
-                        !listContainer.isConnected
-                        || !listContainer.contains(element)
-                    ) return false;
+                        element.isConnected
+                        && listContainer
+                        && listContainer.isConnected
+                        && listContainer.contains(element)
+                    ) {
+                        const style = getComputedStyle(element);
+                        const elementRect = element.getBoundingClientRect();
+                        const listRect = listContainer.getBoundingClientRect();
+                        actionable = (
+                            style.display !== "none"
+                            && style.visibility === "visible"
+                            && style.pointerEvents !== "none"
+                            && elementRect.width > 0
+                            && elementRect.height > 0
+                            && Math.min(elementRect.right, listRect.right)
+                                > Math.max(elementRect.left, listRect.left)
+                            && Math.min(elementRect.bottom, listRect.bottom)
+                                > Math.max(elementRect.top, listRect.top)
+                        );
+                    }
+                    return {
+                        connected: element.isConnected,
+                        stableIndex: indexedAncestor
+                            ? indexedAncestor.getAttribute("data-index")
+                            : null,
+                        titleCount: titles.length,
+                        displayName: titles.length === 1
+                            ? titles[0].textContent
+                            : null,
+                        actionable,
+                    };
+                });
+                return {
+                    listContainerCount: listContainers.length,
+                    items,
+                };
+                }""",
+                {
+                    "list": CONVERSATION_LIST_SELECTOR,
+                    "title": CONVERSATION_TITLE_SELECTOR,
+                },
+            )
+        except Exception:
+            if attempt + 1 >= MAX_ATOMIC_DOM_SNAPSHOT_ATTEMPTS:
+                raise ConversationSelectionError(
+                    "原子读取会话 DOM 快照重试后仍失败，无法完成安全扫描"
+                ) from None
+            page.wait_for_timeout(DOM_CONFIRM_POLL_INTERVAL_MS)
+            continue
 
-                    const style = getComputedStyle(element);
-                    if (
-                        style.display === "none"
-                        || style.visibility !== "visible"
-                        || style.pointerEvents === "none"
-                    ) return false;
-                    const elementRect = element.getBoundingClientRect();
-                    const listRect = listContainer.getBoundingClientRect();
-                    return (
-                        elementRect.width > 0
-                        && elementRect.height > 0
-                        && Math.min(elementRect.right, listRect.right)
-                            > Math.max(elementRect.left, listRect.left)
-                        && Math.min(elementRect.bottom, listRect.bottom)
-                            > Math.max(elementRect.top, listRect.top)
-                    );
-                } catch (_ignored) {
-                    return false;
-                }
-            }"""
-        ) is True
-    except Exception:
-        # 这是点击前的只读可操作性探针。Playwright/DOM 异常不能降级为“可点击”，
-        # 也不能把可能包含页面信息的原始异常带入账号日志。
-        return False
+        # 唯一列表容器中的非空 items 才算取得有效观察点。空数组可能来自 React
+        # 正在替换虚拟列表根节点，允许短暂重读；非空但字段结构异常则在循环后立即
+        # fail-closed，不能通过重试碰巧绕过永久错误项。
+        if (
+            isinstance(raw_snapshot, Mapping)
+            and isinstance(raw_snapshot.get("items"), list)
+            and raw_snapshot["items"]
+        ):
+            break
+        if attempt + 1 < MAX_ATOMIC_DOM_SNAPSHOT_ATTEMPTS:
+            page.wait_for_timeout(DOM_CONFIRM_POLL_INTERVAL_MS)
+
+    if (
+        not isinstance(raw_snapshot, Mapping)
+        or type(raw_snapshot.get("listContainerCount")) is not int
+        or raw_snapshot.get("listContainerCount") != 1
+        or not isinstance(raw_snapshot.get("items"), list)
+    ):
+        raise ConversationSelectionError(
+            "会话 DOM 快照中的列表容器或项目结构无效"
+        )
+    if not raw_snapshot["items"]:
+        raise ConversationSelectionError(
+            "原子会话 DOM 快照在有限重试后仍为空，无法证明当前可见窗口"
+        )
+
+    snapshots: List[_ConversationDomItemSnapshot] = []
+    for raw_item in raw_snapshot["items"]:
+        if not isinstance(raw_item, Mapping) or raw_item.get("connected") is not True:
+            raise ConversationSelectionError(
+                "会话项在原子快照期间已脱离 DOM，已取消本轮扫描"
+            )
+        raw_index = raw_item.get("stableIndex")
+        if (
+            not isinstance(raw_index, str)
+            or re.fullmatch(r"0|[1-9]\d*", raw_index) is None
+        ):
+            raise ConversationSelectionError(
+                "会话项缺少有效的稳定 data-index 祖先，无法完成安全扫描"
+            )
+        if (
+            type(raw_item.get("titleCount")) is not int
+            or raw_item.get("titleCount") != 1
+        ):
+            raise ConversationSelectionError(
+                "会话项标题节点不是唯一元素，无法建立稳定身份映射"
+            )
+        display_name = _normalize_identity_value(raw_item.get("displayName"))
+        if not display_name:
+            raise ConversationSelectionError(
+                "会话项标题为空，无法建立稳定索引与身份的映射"
+            )
+        actionable = raw_item.get("actionable")
+        if type(actionable) is not bool:
+            raise ConversationSelectionError(
+                "会话项可操作性字段无效，无法继续安全扫描"
+            )
+        snapshots.append(
+            _ConversationDomItemSnapshot(
+                stable_index=int(raw_index),
+                display_name=display_name,
+                actionable=actionable,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _conversation_item_selector_for_stable_index(stable_index: int) -> str:
+    """构造由虚拟列表稳定索引锚定的会话项选择器。
+
+    索引已经过非负整数校验，因此可以安全放入 CSS 属性选择器。与旧 ``nth``
+    Locator 相比，该选择器在 DOM 节点重建后仍按本轮 authority 的位置重新解析；
+    若页面意外产生零个或多个匹配，后续严格 ``Locator.evaluate`` 会 fail-closed。
+    """
+
+    if type(stable_index) is not int or stable_index < 0:
+        raise ConversationSelectionError("会话稳定索引无效，无法构造安全定位器")
+    return (
+        f'{CONVERSATION_LIST_SELECTOR} '
+        f'[data-index="{stable_index}"] {CONVERSATION_ITEM_SELECTOR}'
+    )
 
 
 def _click_conversation_at_authority_boundary(
@@ -1171,24 +1308,6 @@ def _read_stable_conversation_index(
     return int(raw_index)
 
 
-def _read_conversation_item(
-    item: Any,
-    timeout_ms: int = DOM_CONFIRM_POLL_INTERVAL_MS,
-) -> Tuple[int, str]:
-    """以短时读取取得一个会话项的稳定索引和规范化显示名。"""
-
-    stable_index = _read_stable_conversation_index(item, timeout_ms)
-    title = item.locator(CONVERSATION_TITLE_SELECTOR).inner_text(
-        timeout=max(1, int(timeout_ms)),
-    )
-    display_name = _normalize_identity_value(title)
-    if not display_name:
-        raise ConversationSelectionError(
-            "会话项标题为空，无法建立稳定索引与身份的映射"
-        )
-    return stable_index, display_name
-
-
 def _get_conversation_list_handle(page: Any) -> Any:
     """取得唯一滚动容器句柄；缺失时不允许继续到点击阶段。"""
 
@@ -1355,13 +1474,13 @@ def _record_visible_inventory(
     page: Any,
     inventory: MutableMapping[int, str],
 ) -> int:
-    """只读记录当前可见项，并拒绝索引重复或跨轮映射冲突。"""
+    """用原子 DOM 快照记录当前窗口，并拒绝索引重复或跨轮映射冲突。"""
 
-    visible_items = page.locator(CONVERSATION_ITEM_SELECTOR).all()
     round_indices: Set[int] = set()
     added_count = 0
-    for item in visible_items:
-        stable_index, display_name = _read_conversation_item(item)
+    for item_snapshot in _read_atomic_conversation_dom_snapshot(page):
+        stable_index = item_snapshot.stable_index
+        display_name = item_snapshot.display_name
         if stable_index in round_indices:
             raise ConversationSelectionError(
                 "同一轮出现重复 data-index，会话库存身份不唯一"
@@ -1751,8 +1870,9 @@ def scroll_and_select_user(
                     "发送阶段读取窗口前权威会话顺序已变化，已取消点击"
                 )
             round_indices: Set[int] = set()
-            for element in page.locator(CONVERSATION_ITEM_SELECTOR).all():
-                stable_index, display_name = _read_conversation_item(element)
+            for item_snapshot in _read_atomic_conversation_dom_snapshot(page):
+                stable_index = item_snapshot.stable_index
+                display_name = item_snapshot.display_name
                 if stable_index in round_indices:
                     raise ConversationSelectionError(
                         "发送阶段同一轮出现重复 data-index，列表状态已变化"
@@ -1770,11 +1890,14 @@ def scroll_and_select_user(
                     raise ConversationSelectionError(
                         "目标会话标题偏离本轮预扫描计划，已在输入前终止"
                     )
-                if not _conversation_item_is_actionable_in_list(element):
+                if not item_snapshot.actionable:
                     # 虚拟列表的 overscan 会把尚未进入容器可视区域的目标保留在
-                    # DOM。它仍参与完整库存和唯一性校验，但不能在本轮被选为点击
-                    # 候选；继续滚动后，由同一稳定索引的真实相交项再次通过筛选。
+                    # DOM。可操作性与索引、标题来自同一次浏览器快照，避免另一次
+                    # Locator.evaluate 恰遇重绘；真正点击边界仍会原子复核几何。
                     continue
+                element = page.locator(
+                    _conversation_item_selector_for_stable_index(stable_index)
+                )
                 selected = (stable_index, plan_entry, element)
 
             authority_after = _read_authoritative_conversation_snapshot(page)

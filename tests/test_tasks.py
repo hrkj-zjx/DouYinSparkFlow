@@ -59,6 +59,54 @@ def make_authority_snapshot(size, **kwargs):
     )
 
 
+def make_atomic_dom_snapshot(elements):
+    """模拟浏览器在一个同步 JavaScript 任务内返回的会话 DOM 快照。
+
+    Fake 直接从同一份元素列表读取全部字段，刻意不调用项目 Locator 的
+    ``count/get_attribute/inner_text``。这样测试一旦误退回旧的分步读取路径就会
+    由专门的竞态替身失败，而不是被静态 Fake 的即时返回掩盖生产虚拟列表问题。
+    """
+
+    return {
+        "listContainerCount": 1,
+        "items": [
+            {
+                "connected": item.connected,
+                "stableIndex": (
+                    None if item.stable_index is None else str(item.stable_index)
+                ),
+                "titleCount": 1,
+                "displayName": item.display_name,
+                "actionable": item.connected and item.actionable,
+            }
+            for item in elements
+        ],
+    }
+
+
+def find_fake_item_by_stable_selector(selector, elements):
+    """解析生产稳定索引选择器并返回唯一 Fake 会话项。
+
+    生产代码不再保存 ``locator.all()`` 展开的易失 ``nth`` Locator，而是在原子
+    快照后按 ``data-index`` 重建当前节点。Fake 使用生产选择器生成函数逐项比较，
+    可以锁定这一契约；零项表示该 selector 不是索引定位，重复项则模拟 Playwright
+    严格模式拒绝歧义，绝不能静默取第一个。
+    """
+
+    matches = [
+        item
+        for item in elements
+        if type(item.stable_index) is int
+        and selector
+        == tasks._conversation_item_selector_for_stable_index(item.stable_index)
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise AssertionError("稳定索引选择器匹配到多个 Fake 会话项")
+    return matches[0]
+
+
 class DelayedResponse:
     """第一次读取失败、第二次返回数据，用于模拟响应体延迟。"""
 
@@ -335,6 +383,41 @@ class FakeConversationItem:
         return " ".join(classes)
 
 
+class PreClickRacyConversationItem(FakeConversationItem):
+    """复现线上 ``count()==1`` 后属性读取超时的动态会话项。
+
+    旧扫描会在第一次点击前分两次读取祖先，因而必然触发这里的合成 TimeoutError；
+    新扫描必须完全绕开该路径。点击后的双重确认仍允许正常读取索引，确保测试验证
+    的是“预扫描与发送搜索采用原子快照”，而不是粗暴删除全部后置身份核验。
+    """
+
+    class RacyIndexedAncestor:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def count(self):
+            return 1
+
+        def get_attribute(self, attribute_name, timeout=None):
+            if attribute_name != "data-index":
+                raise AssertionError(f"未预期读取竞态索引属性：{attribute_name}")
+            if not self.owner.clicked:
+                self.owner.pre_click_attribute_reads += 1
+                raise TimeoutError(
+                    "Locator.get_attribute: Timeout 100ms exceeded. 合成敏感内容"
+                )
+            return str(self.owner.stable_index)
+
+    def __init__(self, display_name, stable_index=0):
+        super().__init__(display_name, stable_index=stable_index)
+        self.pre_click_attribute_reads = 0
+
+    def locator(self, selector):
+        if selector == tasks.CONVERSATION_INDEX_ANCESTOR_SELECTOR:
+            return self.RacyIndexedAncestor(self)
+        return super().locator(selector)
+
+
 class FakePage:
     """仅实现 ``do_user_task`` 在受测路径会使用的同步页面接口。"""
 
@@ -582,8 +665,17 @@ class DelayedIdentityScrollPage:
         def __init__(self, elements):
             self.elements = elements
 
-        def all(self):
-            return self.elements
+        def evaluate_all(self, expression, selectors):
+            # 锁定生产代码使用单次浏览器快照；旧 ``all()`` 方法被有意移除，
+            # 任何回退到动态 nth Locator 的实现都会立刻以 AttributeError 失败。
+            if "readAtomicConversationDomSnapshot" not in expression:
+                raise AssertionError("未预期的会话 DOM 快照脚本")
+            if selectors != {
+                "list": tasks.CONVERSATION_LIST_SELECTOR,
+                "title": tasks.CONVERSATION_TITLE_SELECTOR,
+            }:
+                raise AssertionError("原子会话快照选择器参数不完整")
+            return make_atomic_dom_snapshot(self.elements)
 
     class ScrollLocator:
         def __init__(self, handle):
@@ -610,6 +702,10 @@ class DelayedIdentityScrollPage:
     def locator(self, selector):
         if selector == tasks.CONVERSATION_ITEM_SELECTOR:
             return self.ItemsLocator([self.element])
+        indexed_item = find_fake_item_by_stable_selector(selector, [self.element])
+        if indexed_item is not None:
+            indexed_item.authority_page = self
+            return indexed_item
         if selector == tasks.CONVERSATION_LIST_SELECTOR:
             return self.ScrollLocator(self.scroll_handle)
         if selector == tasks.RIGHT_PANEL_TITLE_SELECTOR:
@@ -646,8 +742,17 @@ class FakeConversationListPage:
         def __init__(self, elements):
             self.elements = elements
 
-        def all(self):
-            return self.elements
+        def evaluate_all(self, expression, selectors):
+            # Fake 返回与真实 evaluate_all 相同的序列化结构，不允许生产代码逐项
+            # 调用 Locator；这同时覆盖预扫描和发送阶段两条历史竞态路径。
+            if "readAtomicConversationDomSnapshot" not in expression:
+                raise AssertionError("未预期的会话 DOM 快照脚本")
+            if selectors != {
+                "list": tasks.CONVERSATION_LIST_SELECTOR,
+                "title": tasks.CONVERSATION_TITLE_SELECTOR,
+            }:
+                raise AssertionError("原子会话快照选择器参数不完整")
+            return make_atomic_dom_snapshot(self.elements)
 
     class ScrollLocator:
         def __init__(self, handle):
@@ -696,6 +801,13 @@ class FakeConversationListPage:
                 # 绑定 owner，保证新建的 fake 项也能执行原子 authority 点击门禁。
                 item.authority_page = self
             return self.ItemsLocator(self.visible_elements)
+        indexed_item = find_fake_item_by_stable_selector(
+            selector,
+            self.visible_elements,
+        )
+        if indexed_item is not None:
+            indexed_item.authority_page = self
+            return indexed_item
         if selector == tasks.CONVERSATION_LIST_SELECTOR:
             return self.ScrollLocator(self.scroll_handle)
         if selector == tasks.RIGHT_PANEL_TITLE_SELECTOR:
@@ -734,6 +846,50 @@ class FakeConversationListPage:
         self.waited_milliseconds.append(milliseconds)
 
 
+class RerenderingConversationListPage(FakeConversationListPage):
+    """按脚本返回异常、空窗或成功快照，模拟虚拟列表整棵重绘。"""
+
+    class RerenderingItemsLocator:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def evaluate_all(self, expression, selectors):
+            if "readAtomicConversationDomSnapshot" not in expression:
+                raise AssertionError("未预期的重绘会话 DOM 快照脚本")
+            if selectors != {
+                "list": tasks.CONVERSATION_LIST_SELECTOR,
+                "title": tasks.CONVERSATION_TITLE_SELECTOR,
+            }:
+                raise AssertionError("重绘快照选择器参数不完整")
+            self.owner.atomic_snapshot_calls += 1
+            outcome_index = min(
+                self.owner.atomic_snapshot_calls - 1,
+                len(self.owner.snapshot_outcomes) - 1,
+            )
+            outcome = self.owner.snapshot_outcomes[outcome_index]
+            if outcome == "error":
+                raise RuntimeError("合成瞬时 DOM 异常，含不应泄漏的页面内容")
+            if outcome == "empty":
+                return make_atomic_dom_snapshot([])
+            if outcome == "ok":
+                return make_atomic_dom_snapshot(self.owner.visible_elements)
+            raise AssertionError(f"未预期的原子快照结果脚本：{outcome}")
+
+    def __init__(self, elements, right_title, snapshot_outcomes):
+        if not snapshot_outcomes:
+            raise ValueError("重绘快照脚本不能为空")
+        super().__init__(elements, right_title)
+        self.snapshot_outcomes = list(snapshot_outcomes)
+        self.atomic_snapshot_calls = 0
+
+    def locator(self, selector):
+        if selector == tasks.CONVERSATION_ITEM_SELECTOR:
+            for item in self.visible_elements:
+                item.authority_page = self
+            return self.RerenderingItemsLocator(self)
+        return super().locator(selector)
+
+
 class ScriptedInventoryPage:
     """按独立 pass 提供库存快照，用于复现线上分批懒加载。
 
@@ -747,8 +903,17 @@ class ScriptedInventoryPage:
         def __init__(self, owner):
             self.owner = owner
 
-        def all(self):
-            return self.owner.current_items
+        def evaluate_all(self, expression, selectors):
+            # 脚本型库存每个 pass 都在调用瞬间取 current_items，模拟虚拟列表已经
+            # 切换到新窗口；整个窗口仍由一次 evaluate_all 原子序列化。
+            if "readAtomicConversationDomSnapshot" not in expression:
+                raise AssertionError("未预期的会话 DOM 快照脚本")
+            if selectors != {
+                "list": tasks.CONVERSATION_LIST_SELECTOR,
+                "title": tasks.CONVERSATION_TITLE_SELECTOR,
+            }:
+                raise AssertionError("原子会话快照选择器参数不完整")
+            return make_atomic_dom_snapshot(self.owner.current_items)
 
     class ScrollLocator:
         def __init__(self, handle):
@@ -911,6 +1076,82 @@ class MidScanAuthorityChangePage(ScriptedInventoryPage):
 
 
 class TaskReliabilityTests(unittest.TestCase):
+    def test_atomic_snapshot_bypasses_pre_click_attribute_timeout_race(self):
+        """扫描不得再触发 count 成功后 get_attribute 超时的旧竞态路径。"""
+
+        item = PreClickRacyConversationItem("重绘好友", stable_index=0)
+        page = FakeConversationListPage([item], right_title="重绘好友")
+
+        selected = list(
+            tasks.scroll_and_select_user(
+                page,
+                "原子快照账号",
+                ["重绘好友"],
+                identity_index=None,
+                friend_list_wait_time=1,
+                confirmation_timeout=100,
+            )
+        )
+
+        # 旧实现会在首次预扫描就触发合成 TimeoutError；新实现应一直到原子点击后
+        # 才由确认探针读取祖先。零次点击前属性读取证明预扫描和发送搜索均已迁移。
+        self.assertEqual(item.pre_click_attribute_reads, 0)
+        self.assertEqual(item.click_count, 1)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].display_name, "重绘好友")
+
+    def test_atomic_snapshot_retries_error_and_empty_rerender_then_recovers(self):
+        """协议异常与整棵空窗各一次后，应在第三个原子观察点安全恢复。"""
+
+        item = FakeConversationItem("恢复好友", stable_index=0)
+        page = RerenderingConversationListPage(
+            [item],
+            right_title="恢复好友",
+            snapshot_outcomes=["error", "empty", "ok"],
+        )
+        inventory = {}
+
+        added_count = tasks._record_visible_inventory(page, inventory)
+
+        self.assertEqual(inventory, {0: "恢复好友"})
+        self.assertEqual(added_count, 1)
+        self.assertEqual(page.atomic_snapshot_calls, 3)
+        self.assertEqual(
+            page.waited_milliseconds,
+            [
+                tasks.DOM_CONFIRM_POLL_INTERVAL_MS,
+                tasks.DOM_CONFIRM_POLL_INTERVAL_MS,
+            ],
+        )
+        self.assertEqual(item.click_count, 0)
+
+    def test_atomic_snapshot_permanent_failure_is_bounded_and_redacted(self):
+        """持续重绘异常只能有限重试，且错误正文和页面内容不得进入结果。"""
+
+        item = FakeConversationItem("不会泄漏的好友标题", stable_index=0)
+        page = RerenderingConversationListPage(
+            [item],
+            right_title="不会泄漏的好友标题",
+            snapshot_outcomes=["error"],
+        )
+        inventory = {}
+
+        with self.assertRaises(tasks.ConversationSelectionError) as caught:
+            tasks._record_visible_inventory(page, inventory)
+
+        self.assertEqual(
+            page.atomic_snapshot_calls,
+            tasks.MAX_ATOMIC_DOM_SNAPSHOT_ATTEMPTS,
+        )
+        self.assertEqual(
+            len(page.waited_milliseconds),
+            tasks.MAX_ATOMIC_DOM_SNAPSHOT_ATTEMPTS - 1,
+        )
+        self.assertNotIn("合成瞬时 DOM 异常", str(caught.exception))
+        self.assertNotIn("不会泄漏的好友标题", str(caught.exception))
+        self.assertEqual(inventory, {})
+        self.assertEqual(item.click_count, 0)
+
     def test_authority_participant_strong_id_selects_offscreen_same_name(self):
         """同名 DOM 不影响 sec_uid join；强标识只授权对应 participant 索引。"""
 
