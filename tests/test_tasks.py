@@ -2244,8 +2244,194 @@ class TaskReliabilityTests(unittest.TestCase):
         self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
         self.assertTrue(context.closed)
 
+    def test_direct_account_task_uses_normalized_pending_ledger_keys(self):
+        """直接调用传入非规范化标识时，成功提交后也必须准确扣减待处理账本。"""
+
+        chat_input = FakeChatInput()
+        page = FakePage(chat_input=chat_input, right_title="规范化好友")
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        item = FakeConversationItem("规范化好友")
+        item.active = True
+        selection = tasks.ConfirmedConversation(
+            "目标 一",
+            "规范化好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
+
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            return_value=[selection],
+        ) as select_user, patch.object(tasks, "_build_message", return_value="规范化消息"):
+            result = tasks.do_user_task(
+                browser,
+                "规范化账本账号",
+                [],
+                ["　目标   一 "],
+                runtime_config=TEST_CONFIG,
+            )
+
+        self.assertEqual(result.requested_targets, ("目标 一",))
+        self.assertEqual(result.submitted_targets, ("目标 一",))
+        self.assertEqual(result.missing_targets, ())
+        self.assertEqual(select_user.call_args.args[2], ("目标 一",))
+        self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
+        self.assertTrue(context.closed)
+
+    def test_pre_input_evidence_failure_reselects_once_without_duplicate_enter(self):
+        """零输入阶段旧 proof 失效时应完整重选一次，且最终只提交一次。"""
+
+        chat_input = FakeChatInput()
+        page = FakePage(chat_input=chat_input, right_title="重选好友")
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        item = FakeConversationItem("重选好友")
+        item.active = True
+        selection = tasks.ConfirmedConversation(
+            "重选目标",
+            "重选好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
+
+        # 第一次选择在任何输入前被判定失效；第二轮重新全量选择后，编辑器出现和
+        # 消息构建后的两次 proof 均稳定。即使 selection 对象相同，生产账本也只能
+        # 在最终 Enter 清空后扣除一次，不能因重选重复提交。
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            return_value=[selection],
+        ) as select_user, patch.object(
+            tasks,
+            "_wait_for_pre_input_selection_stability",
+            side_effect=[False, True, True],
+        ), patch.object(tasks, "_build_message", return_value="仅提交一次") as build_message:
+            result = tasks.do_user_task(
+                browser,
+                "重选账号",
+                [],
+                ["重选目标"],
+                runtime_config=TEST_CONFIG,
+            )
+
+        self.assertEqual(result.state, tasks.TaskState.SUBMITTED_UNCONFIRMED)
+        self.assertEqual(result.submitted_targets, ("重选目标",))
+        self.assertEqual(select_user.call_count, 2)
+        build_message.assert_called_once_with()
+        self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
+        self.assertTrue(context.closed)
+
+    def test_pre_input_short_stability_window_absorbs_one_transient_probe(self):
+        """第一次瞬时探针失配后恢复时，不应进入昂贵的全列表重选。"""
+
+        page = FakePage(right_title="瞬时恢复好友")
+        item = FakeConversationItem("瞬时恢复好友")
+        item.active = True
+        selection = tasks.ConfirmedConversation(
+            "瞬时恢复目标",
+            "瞬时恢复好友",
+            item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
+
+        # 第一次 False 表示 React 正在提交重绘，下一观察点即恢复。这里只验证短等待
+        # 会吸收一次抖动；完整重选由相邻的 do_user_task 回归测试单独锁定。
+        with patch.object(
+            tasks,
+            "_conversation_selection_matches",
+            side_effect=[False, True],
+        ) as selection_matches:
+            recovered = tasks._wait_for_pre_input_selection_stability(
+                page,
+                selection,
+                browser_timeout_ms=20,
+            )
+
+        self.assertTrue(recovered)
+        self.assertEqual(selection_matches.call_count, 2)
+        self.assertEqual(len(page.waited_milliseconds), 1)
+        self.assertGreater(page.waited_milliseconds[0], 0)
+        self.assertLessEqual(page.waited_milliseconds[0], 20)
+
+    def test_permanent_pre_input_failure_skips_target_and_continues_account(self):
+        """同一逻辑会话连续失效时应有界跳过，并继续提交账号内其他目标。"""
+
+        chat_input = FakeChatInput()
+        page = FakePage(chat_input=chat_input, right_title="失效好友")
+        context = FakeContext(page)
+        browser = FakeBrowser(context)
+        stale_item = FakeConversationItem("失效好友")
+        stale_item.active = True
+        stable_item = FakeConversationItem("正常好友")
+        stable_item.active = True
+        stale_selection = tasks.ConfirmedConversation(
+            "失效目标",
+            "失效好友",
+            stale_item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
+        stable_selection = tasks.ConfirmedConversation(
+            "正常目标",
+            "正常好友",
+            stable_item,
+            stable_index=0,
+            authority_proof=make_authority_snapshot(1),
+        )
+
+        def select_one_pending_target(
+            ignored_page,
+            ignored_username,
+            pending_targets,
+            **ignored_options,
+        ):
+            # 前两轮待处理账本不变，证明第一次失败只触发一次重选；达到上限后
+            # 失效目标才从 pending 移除，第三轮必须只规划尚未提交的正常目标。
+            if tuple(pending_targets) == ("失效目标", "正常目标"):
+                page.right_title.text = "失效好友"
+                return [stale_selection]
+            self.assertEqual(tuple(pending_targets), ("正常目标",))
+            page.right_title.text = "正常好友"
+            return [stable_selection]
+
+        with patch.object(
+            tasks,
+            "scroll_and_select_user",
+            side_effect=select_one_pending_target,
+        ) as select_user, patch.object(
+            tasks,
+            "_wait_for_pre_input_selection_stability",
+            side_effect=[False, False, True, True],
+        ), patch.object(tasks, "_build_message", return_value="正常目标消息"):
+            result = tasks.do_user_task(
+                browser,
+                "部分恢复账号",
+                [],
+                ["失效目标", "正常目标"],
+                runtime_config=TEST_CONFIG,
+            )
+
+        self.assertEqual(result.state, tasks.TaskState.PARTIAL_FAILURE)
+        self.assertEqual(result.submitted_targets, ("正常目标",))
+        self.assertEqual(result.missing_targets, ("失效目标",))
+        self.assertEqual(
+            [call.args[2] for call in select_user.call_args_list],
+            [
+                ("失效目标", "正常目标"),
+                ("失效目标", "正常目标"),
+                ("正常目标",),
+            ],
+        )
+        self.assertEqual(chat_input.actions.count(("press", "Enter")), 1)
+        self.assertTrue(context.closed)
+
     def test_message_build_state_change_is_rechecked_before_first_type(self):
-        """远程消息构建期间标题变化时，返回后必须在零输入状态终止。"""
+        """消息构建期间标题变化时应有界重选后跳过，且保持零输入。"""
 
         chat_input = FakeChatInput()
         page = FakePage(chat_input=chat_input, right_title="确认好友")
@@ -2271,20 +2457,24 @@ class TaskReliabilityTests(unittest.TestCase):
             tasks,
             "scroll_and_select_user",
             return_value=[selection],
-        ), patch.object(
+        ) as select_user, patch.object(
             tasks,
             "_build_message",
             side_effect=build_message_and_change_conversation,
-        ):
-            with self.assertRaises(tasks.ConversationSelectionError):
-                tasks.do_user_task(
-                    browser,
-                    "构建竞态账号",
-                    [],
-                    ["目标一"],
-                    runtime_config={**TEST_CONFIG, "browserTimeout": 1},
-                )
+        ) as build_message:
+            result = tasks.do_user_task(
+                browser,
+                "构建竞态账号",
+                [],
+                ["目标一"],
+                runtime_config={**TEST_CONFIG, "browserTimeout": 1},
+            )
 
+        self.assertEqual(result.state, tasks.TaskState.PARTIAL_FAILURE)
+        self.assertEqual(result.submitted_targets, ())
+        self.assertEqual(result.missing_targets, ("目标一",))
+        self.assertEqual(select_user.call_count, 2)
+        build_message.assert_called_once_with()
         self.assertEqual(chat_input.actions, [])
         self.assertTrue(context.closed)
 

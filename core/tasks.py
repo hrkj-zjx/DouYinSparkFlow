@@ -77,6 +77,13 @@ EDITOR_CONTENT_UNKNOWN = "EDITOR_CONTENT_UNKNOWN"
 BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
 USER_INFO_URL_FRAGMENT = "aweme/v1/web/im/user/info"
 DOM_CONFIRM_POLL_INTERVAL_MS = 100
+# 输入任何字符之前若恰逢 React/IM store 的短暂重绘，先给旧证明一个很短的恢复
+# 窗口。这里不能沿用最长可达 300 秒的浏览器超时，否则单个抖动会再次阻塞整批；
+# 300ms 足以跨过常见的一次渲染提交，仍未恢复时再丢弃旧 proof 并完整重选。
+PRE_INPUT_STABILITY_GRACE_MS = 300
+# 旧 proof 在短等待后仍失效时，只允许一次“零输入、零 Enter”状态下的完整重选。
+# 第二次仍失败就跳过该逻辑会话并继续账号内其他目标，避免永久变化形成活锁。
+MAX_PRE_INPUT_RESELECTIONS = 1
 # 目标项已经在原子快照中证明位于可交互区域，因此真实鼠标点击不应继续继承全局
 # 120 秒浏览器超时。限定为 5 秒可以在站点 actionability 异常时快速失败，同时仍给
 # Playwright 足够时间完成一次可信 pointer/mouse/click 事件序列。
@@ -1293,6 +1300,37 @@ def _wait_for_confirmed_conversation(
     raise ConversationSelectionError(
         "点击会话后未能同时确认当前项状态与右侧标题，已在输入前终止"
     )
+
+
+def _wait_for_pre_input_selection_stability(
+    page: Any,
+    selection: ConfirmedConversation,
+    browser_timeout_ms: int,
+) -> bool:
+    """在零输入阶段短暂等待旧会话证明恢复，且绝不重复点击目标。
+
+    该恢复窗口只覆盖编辑器出现或消息构建引发的瞬时 DOM 重绘。它继续要求完整
+    authority、稳定索引、当前项 class 与右侧标题全部等于旧 proof；若页面已经发生
+    真实重排则返回 ``False``，由调用方丢弃旧选择并重新全量扫描。函数本身不点击、
+    不输入、更不会按 Enter，因此有限重试不会制造重复消息副作用。
+    """
+
+    bounded_timeout = max(
+        1,
+        min(int(browser_timeout_ms), PRE_INPUT_STABILITY_GRACE_MS),
+    )
+    try:
+        _wait_for_confirmed_conversation(
+            page,
+            selection.item,
+            selection.display_name,
+            bounded_timeout,
+            expected_stable_index=selection.stable_index,
+            expected_authority=selection.authority_proof,
+        )
+    except ConversationSelectionError:
+        return False
+    return True
 
 
 def _read_stable_conversation_index(
@@ -2571,12 +2609,23 @@ def do_user_task(
     targets: Sequence[str],
     runtime_config: Optional[Mapping[str, Any]] = None,
 ) -> TaskResult:
-    """执行一个账号的同步任务，并保证其浏览器上下文最终被关闭。"""
+    """执行一个账号的同步任务，并保证其浏览器上下文最终被关闭。
+
+    当前账号的待处理标识由本函数持有，只有 Enter 后编辑器清空才会移除。这样输入
+    前 proof 失效时可以安全丢弃旧生成器并重选；连续失效的逻辑会话会记为缺失后
+    跳过，其他目标仍继续执行。任何已经开始输入或尝试 Enter 的路径仍立即失败，
+    绝不通过重跑产生重复发送。
+    """
 
     task_config = dict(runtime_config or get_config())
     context = None
     submitted_targets: List[str] = []
-    requested_targets = tuple(targets)
+    # 选择计划返回的是规范化标识，待处理/已提交/缺失三本账必须使用同一种键。
+    # 真实配置入口已经做过该转换，但直接调用此函数时仍需自卫；否则 Enter 成功后
+    # 可能因原始空白与规范化键不同而无法扣账，下一次运行就存在重复提交风险。
+    requested_targets = tuple(_normalize_identity_value(target) for target in targets)
+    pending_targets = list(requested_targets)
+    pre_input_reselection_counts: Dict[str, int] = {}
 
     try:
         # 每个账号使用独立 context 和独立身份索引；Cookie、页面响应与好友映射
@@ -2617,14 +2666,45 @@ def do_user_task(
 
         logger.debug("账号 %s 开始处理好友消息", username)
         message: Optional[str] = None
-        for selection in scroll_and_select_user(
-            page,
-            username,
-            targets,
-            identity_index=identity_index,
-            friend_list_wait_time=task_config["friendListTimeout"],
-            confirmation_timeout=task_config["browserTimeout"],
-        ):
+        while pending_targets:
+            # 每轮只消费生成器产出的一个选择，并立即关闭生成器。待处理账本由当前
+            # 函数在确认提交后更新，避免旧生成器在恢复时把未发送目标误当作完成。
+            selection_iterator = iter(
+                scroll_and_select_user(
+                    page,
+                    username,
+                    tuple(pending_targets),
+                    identity_index=identity_index,
+                    friend_list_wait_time=task_config["friendListTimeout"],
+                    confirmation_timeout=task_config["browserTimeout"],
+                )
+            )
+            try:
+                selection = next(selection_iterator)
+            except StopIteration:
+                raise ConversationSelectionError(
+                    "仍有待处理目标但会话选择器未返回结果，已终止当前账号"
+                ) from None
+            finally:
+                close_selection_iterator = getattr(selection_iterator, "close", None)
+                if callable(close_selection_iterator):
+                    close_selection_iterator()
+
+            # 防御内部计划或未来调用方错误：一次选择只能覆盖当前待处理集合中的
+            # 非空、非重复标识。否则继续可能重复提交已经确认过的历史目标。
+            if (
+                not selection.covered_targets
+                or len(set(selection.covered_targets))
+                != len(selection.covered_targets)
+                or any(
+                    target not in pending_targets
+                    for target in selection.covered_targets
+                )
+            ):
+                raise ConversationSelectionError(
+                    "会话选择覆盖集合偏离当前待处理账本，已禁止继续发送"
+                )
+
             # ConfirmedConversation 保留两个 Optional 仅用于旧调用方构造兼容；真实
             # 发送路径绝不能因此退回 DOM-only。必须在取得编辑器、构建消息或输入
             # 任何字符之前证明生成器携带了稳定索引与完整 authority 快照。
@@ -2647,18 +2727,38 @@ def do_user_task(
                 task_config["browserTimeout"],
             )
 
-            # 编辑器出现和草稿检查可能经历页面重渲染。输入前再次做一次无等待的
-            # 双证据核验，确保当前项仍是刚才点击的同一会话。
-            if not _conversation_selection_matches(
+            # 编辑器出现和草稿检查可能经历页面重渲染。先给旧 proof 一个严格的
+            # 短恢复窗口；仍失效时只允许在零输入边界丢弃它并完整重选一次。
+            if not _wait_for_pre_input_selection_stability(
                 page,
-                selection.item,
-                selection.display_name,
-                expected_stable_index=selection.stable_index,
-                expected_authority=selection.authority_proof,
+                selection,
+                task_config["browserTimeout"],
             ):
-                raise ConversationSelectionError(
-                    "输入前会话双重证据已失效，已终止当前账号"
+                reselection_count = max(
+                    pre_input_reselection_counts.get(target, 0)
+                    for target in selection.covered_targets
                 )
+                reselection_count += 1
+                for target in selection.covered_targets:
+                    pre_input_reselection_counts[target] = reselection_count
+                if reselection_count <= MAX_PRE_INPUT_RESELECTIONS:
+                    logger.warning(
+                        "输入前会话证据未在短窗口内恢复，丢弃旧证明并完整重选："
+                        "重选次数=%s/%s，覆盖配置标识数=%s",
+                        reselection_count,
+                        MAX_PRE_INPUT_RESELECTIONS,
+                        len(selection.covered_targets),
+                    )
+                    _wait_for_page(page, DOM_CONFIRM_POLL_INTERVAL_MS)
+                    continue
+                logger.error(
+                    "输入前会话证据连续失效，已跳过当前逻辑会话并继续后续目标："
+                    "覆盖配置标识数=%s",
+                    len(selection.covered_targets),
+                )
+                for target in selection.covered_targets:
+                    pending_targets.remove(target)
+                continue
 
             # 同一账号同一轮只构建一次消息，避免模板含远程一言时对每个好友重复
             # 请求；如果一个目标都没找到，则完全不构建消息。远程一言请求可能
@@ -2673,16 +2773,36 @@ def do_user_task(
                 page,
                 task_config["browserTimeout"],
             )
-            if not _conversation_selection_matches(
+            if not _wait_for_pre_input_selection_stability(
                 page,
-                selection.item,
-                selection.display_name,
-                expected_stable_index=selection.stable_index,
-                expected_authority=selection.authority_proof,
+                selection,
+                task_config["browserTimeout"],
             ):
-                raise ConversationSelectionError(
-                    "消息构建后会话双重证据已失效，未执行输入"
+                reselection_count = max(
+                    pre_input_reselection_counts.get(target, 0)
+                    for target in selection.covered_targets
                 )
+                reselection_count += 1
+                for target in selection.covered_targets:
+                    pre_input_reselection_counts[target] = reselection_count
+                if reselection_count <= MAX_PRE_INPUT_RESELECTIONS:
+                    logger.warning(
+                        "消息构建后会话证据失效，未输入任何字符并完整重选："
+                        "重选次数=%s/%s，覆盖配置标识数=%s",
+                        reselection_count,
+                        MAX_PRE_INPUT_RESELECTIONS,
+                        len(selection.covered_targets),
+                    )
+                    _wait_for_page(page, DOM_CONFIRM_POLL_INTERVAL_MS)
+                    continue
+                logger.error(
+                    "消息构建后会话证据连续失效，已跳过当前逻辑会话并继续后续目标："
+                    "覆盖配置标识数=%s",
+                    len(selection.covered_targets),
+                )
+                for target in selection.covered_targets:
+                    pending_targets.remove(target)
+                continue
             _type_multiline_message(chat_input, message)
 
             # 输入过程也可能触发页面状态变化。在执行具有外部副作用且不可重试的
@@ -2732,6 +2852,12 @@ def do_user_task(
             # 按一次 Enter。清空证据成立后再把整组别名计入提交结果，防止别名组
             # 被误判为部分缺失并在后续循环对同一好友重复发送。
             submitted_targets.extend(selection.covered_targets)
+            # 只有页面守卫明确放行 Enter 且同一编辑器随后清空，才能提交待处理账本。
+            # 因此输入前重选或跳过永远不会把目标误记为成功，已确认目标也不会在
+            # 下一轮全量扫描中再次进入发送计划。
+            for target in selection.covered_targets:
+                pending_targets.remove(target)
+                pre_input_reselection_counts.pop(target, None)
             logger.info(
                 "一个目标会话已确认且 Enter 后编辑器已清空：覆盖配置标识数=%s，"
                 "记为已提交但未确认送达",
